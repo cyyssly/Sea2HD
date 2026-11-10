@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 The DOSBox Staging Team
+﻿// SPDX-FileCopyrightText: 2026 The DOSBox Staging Team
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "sea2_hd.h"
@@ -8,12 +8,14 @@
 #include <array>
 #include <cassert>
 #include <cctype>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -397,6 +399,177 @@ std::filesystem::path assets_root = "../assets/hd";
 std::array<Asset, Kao64EntryCount> assets = {};
 std::deque<DrawCommand> draw_commands = {};
 
+// The port screen is a 96x96 grid of 16x16 tiles that the game composes into a
+// 1536x1536 map and scrolls through a 384x384 window at (96,48), one whole tile
+// at a time. Both the map and the window are known from the game's own
+// PORTMAP/PORTCHIP files, so the visible part can be drawn at 4x from a single
+// image of the whole map: the offset is found by matching the frame against the
+// reconstructed low resolution map, and every pixel the game painted on top of
+// the map (the walking character, an item, the pointer) keeps the game's pixels.
+constexpr int PortMapStep        = 16;
+constexpr int PortMapGridSize    = 96;
+constexpr int PortMapSize        = PortMapGridSize * PortMapStep;
+constexpr int PortMapWindowX     = 96;
+constexpr int PortMapWindowY     = 48;
+constexpr int PortMapCells       = 24;
+constexpr int PortMapWindowSize  = PortMapCells * PortMapStep;
+constexpr int PortMapCellCount   = PortMapCells * PortMapCells;
+constexpr int PortMapOffsetSteps = PortMapGridSize - PortMapCells;
+
+// Both the map and the window are grid aligned, so one hash per 16x16 cell
+// identifies the picture exactly: a cell either is that tile or it is not, and
+// a window full of such cells pins where the map is to the tile.
+//
+// The window still is the map while most of its cells are, because the
+// character, an item or a dialog only spoils the cells they cover.
+constexpr int PortMapMinCells = (PortMapCellCount * 45) / 100;
+
+// The game fades a screen in by rewriting the palette entry by entry over a
+// handful of frames, so while it does, no colour of the window equals the stored
+// map even though the picture is already complete. A palette is a function of
+// the colour index, so two pixels that are the same colour stay the same while
+// two different ones may become equal: the equality pattern of a cell only ever
+// gains pairs during a fade, never loses them. Such a window is located with
+// that pattern instead, which needs more of the cells to agree because the
+// pattern is coarser than the colours it replaces.
+constexpr int PortMapRelationMinCells = (PortMapCellCount * 55) / 100;
+
+// A 16x16 cell has 15x16 right and 16x15 below neighbour pairs.
+constexpr int PortMapRightBits  = PortMapStep * (PortMapStep - 1);
+constexpr int PortMapRelationBits = 2 * PortMapRightBits;
+constexpr int PortMapRelationWords = (PortMapRelationBits + 63) / 64;
+
+// The offset in use is only kept while the window matches it almost entirely.
+// The terrain repeats, so an offset that is a tile or two off still agrees with
+// about half of the cells; keeping it there would draw the artwork at the wrong
+// place and leave the rest of the window in the game's own resolution.
+constexpr int PortMapKeepCells = (PortMapCellCount * 90) / 100;
+
+// A picture that repeats all over the map pins nothing, so a window made of
+// such cells cannot be located and is left alone.
+constexpr size_t PortMapAnchorMax = 64;
+
+// Reconnaissance: how many frames of a window the map only partly describes are
+// written out, together with the colours that actually differ.
+constexpr int PortMapDiagCount = 8;
+
+// A cell that is only partly the map (the character stands in it) is still
+// drawn pixel by pixel, but a cell that mostly shows something else (a dialog,
+// a label) is left alone entirely so no map pixel leaks into it.
+constexpr int PortMapPartialCell = (PortMapStep * PortMapStep) / 2;
+
+// A message box painted over the port is one flat colour over a large area, and
+// that paper is exactly one of the map's own colours - the cream of the sand.
+// Read off the frame it therefore looks like a piece of the map, and the
+// artwork's outlines would be drawn through the dialog. The map itself is
+// dithered, so the very same colour never runs far: a pixel that sits in a long
+// run both across and down is paper, not map.
+constexpr int PortMapPanelRun = 24;
+
+// The same paper hides a large part of the port, not just a strip of it: a
+// message box or a menu can cover more than half of the window, and then neither
+// the colours nor the equality pattern of the window describe the map any more
+// and the port drops back to the game's own resolution for as long as the panel
+// is open. The paper is a flat area and the map never is, so the cells that
+// consist of it are recognised and left out of the score: what remains is the
+// port, and the port is the map.
+constexpr int PortMapPanelMinCells    = PortMapCellCount / 3;
+constexpr int PortMapPanelMaxCells    = (PortMapCellCount * 3) / 4;
+constexpr int PortMapPanelCellPixels  = (PortMapStep * PortMapStep * 3) / 4;
+// The cells on the border of the box are only partly paper, so the very tile
+// they hold no longer matches as a whole; the rest of the port does.
+constexpr int PortMapPanelKeepPercent = 70;
+
+// The game fades its whole palette out before it opens a building, and on the
+// way to black the entries collapse: colours that the stored map keeps apart
+// become one, the equality pattern of the cells changes and the port is no
+// longer recognised although it is plainly still on screen. The port cannot
+// move while the palette fades, so the offset of the frame before is kept. Less
+// of the pattern has to hold for that, and only right after a frame that drew
+// the port; a building, a shop or another screen does not share the pattern at
+// all and is still left alone.
+constexpr int PortMapBridgeMinCells = (PortMapCellCount * 45) / 100;
+
+// A screen that went all the way to black holds one colour, and nothing of the
+// port can be told apart in it any more.
+constexpr int PortMapBridgeMinColours = 3;
+
+// How many of the sampled pixels the mapping has to explain before it is
+// trusted to describe a window that was not checked cell by cell.
+constexpr int PortMapBridgeExplainedPercent = 80;
+
+// Locating is a handful of cell comparisons now that the hashes exist, so a map
+// that could not be found is looked for again on the next frame: the first
+// frame of the map screen must not stay in the game's own resolution.
+constexpr uint32_t PortMapRetryFrames = 0;
+
+struct PortMap {
+	uint32_t index = 0;
+	// The reconstructed map, one 0x00RRGGBB per pixel, PortMapSize square.
+	std::vector<uint32_t> pixels = {};
+	// One hash per cell of the tile grid, plus where each picture repeats, so a
+	// single distinctive cell is enough to find the offset.
+	std::array<uint64_t, PortMapGridSize * PortMapGridSize> cells = {};
+	std::unordered_map<uint64_t, std::vector<uint16_t>> cell_index = {};
+	// The same grid, but built from the equality pattern of each cell instead of
+	// its colours, so a window whose palette is still fading in is recognised.
+	std::array<uint64_t, PortMapGridSize * PortMapGridSize> relation_hashes = {};
+	std::unordered_map<uint64_t, std::vector<uint16_t>> relation_index = {};
+	// The game recolours the whole port for each time of day. The artwork exists
+	// once, for the palette it was drawn with, so it is scaled by the brightness
+	// difference between this palette and that one.
+	std::array<float, 3> gain = {1.0f, 1.0f, 1.0f};
+	// The average colour the artwork has inside each flat colour of this map.
+	// The artwork is far lighter there than the game's dithered map - black
+	// outlines came out as a pale blue - so drawing it as it is makes the whole
+	// port too bright. The average is computed once, from the map and the
+	// artwork, and the artwork is then centred on the game's own colour.
+	mutable bool art_means_ready = false;
+	mutable std::unordered_map<uint32_t, std::array<float, 3>> art_means = {};
+};
+
+// The artwork and the brightness of the reference palette are shared by every
+// time of day of the same map, because the artwork itself only exists once.
+std::unordered_map<uint32_t, std::vector<uint32_t>> port_map_art = {};
+std::unordered_map<uint32_t, std::array<float, 3>> port_map_palette = {};
+
+std::vector<PortMap> port_maps = {};
+bool port_maps_loaded         = false;
+int port_map_selected         = -1;
+bool port_map_visible         = false;
+int port_map_offset_x         = 0;
+int port_map_offset_y         = 0;
+uint32_t port_map_retry       = 0;
+int port_map_diags            = 0;
+int port_map_loss_logs         = 0;
+int port_map_loss_dumps        = 0;
+int port_map_miss_logs         = 0;
+// One byte per pixel of the window: set when the game painted a panel there,
+// both across and down; see port_panel_mask().
+std::array<uint8_t, PortMapWindowSize * PortMapWindowSize> port_map_panel = {};
+bool port_map_panel_ready = false;
+// Whether the previous frame drew the port, so a frame that loses it is logged
+// once per transition instead of once per frame of a fade.
+bool port_map_drew_last = false;
+// The game fades the screen out on its way into a building, and the map is still
+// there while it does. The window is then a darker copy of the map rather than
+// an exact one, and the artwork follows that brightness instead of stepping
+// aside for the game's own pixels.
+std::array<float, 3> port_map_fade = {1.0f, 1.0f, 1.0f};
+int port_map_rel_logs            = 0;
+int port_map_fade_logs           = 0;
+// Reconnaissance for walking: every change between the artwork and the game's
+// own pixels is logged, because such a change is exactly what a flash looks like.
+int port_map_state_logs  = 0;
+int port_map_last_state  = -1;
+// Set when the window was located by the equality pattern of its cells because
+// its palette is not one of the stored ones. The map is then drawn through the
+// palette read off the frame itself: every colour of the map has exactly one
+// colour on screen, so the artwork keeps the screen's colours and only adds the
+// detail, whatever the palette has become.
+bool port_map_measured = false;
+std::vector<std::pair<uint32_t, uint32_t>> port_map_palette_pairs = {};
+
 // Temporary diagnostic sink: the game is launched without a console, so the
 // decisions about each portrait box are written next to the working directory.
 std::FILE* diag_file = nullptr;
@@ -712,6 +885,26 @@ void reset_assets()
 	text_cells.clear();
 	pending_glyph_record = 0;
 	reset_glyph_index();
+	port_maps.clear();
+	port_map_art.clear();
+	port_map_palette.clear();
+	port_maps_loaded = false;
+	port_map_selected = -1;
+	port_map_visible = false;
+	port_map_fade = {1.0f, 1.0f, 1.0f};
+	port_map_rel_logs = 0;
+	port_map_fade_logs = 0;
+	port_map_state_logs = 0;
+	port_map_last_state = -1;
+	port_map_measured = false;
+	port_map_palette_pairs.clear();
+	port_map_retry = 0;
+	port_map_diags = 0;
+	port_map_loss_logs = 0;
+	port_map_loss_dumps = 0;
+	port_map_miss_logs = 0;
+	port_map_panel_ready = false;
+	port_map_drew_last = false;
 }
 
 const Asset* get_kao64_asset(const uint16_t entry)
@@ -2977,6 +3170,140 @@ uint16_t sea2_hd_trace_loadseg = 0;
 bool sea2_hd_string_trace = false;
 uint32_t sea2_hd_glyph_watch = 0;
 
+// One-off survey of how a screen is painted: every generic blit is tallied per
+// host frame and written out as one line when the frame ends. A screen painted
+// as one big rectangle and a screen painted tile by tile therefore look
+// completely different, which is the only thing this survey has to tell.
+// Only used with `sea2_hd = trace`.
+std::FILE* blit_seq_file          = nullptr;
+uint32_t blit_seq_lines           = 0;
+uint32_t blit_seq_frames          = 0;
+uint32_t blit_seq_total           = 0;
+std::unordered_map<uint32_t, uint32_t> blit_seq_shapes = {};
+// String instructions are the other way a screen gets built: a tiled background
+// is copied plane by plane with `rep movs`, and a whole picture with a single
+// long one. Both cases are counted per frame so the two can be told apart even
+// when neither blitter entry is involved.
+uint32_t blit_seq_string_ops      = 0;
+uint32_t blit_seq_string_bytes    = 0;
+uint32_t blit_seq_string_es_min   = 0xffffffffu;
+uint32_t blit_seq_string_es_max   = 0;
+// A `rep movs` that ran out of cycles is entered again with a smaller CX, so
+// only the largest count seen at one site during a frame is added up.
+std::unordered_map<uint32_t, uint32_t> blit_seq_string_max = {};
+std::chrono::steady_clock::time_point blit_seq_clock_start = {};
+constexpr uint32_t BlitSeqMaxLines = 200000;
+constexpr uint32_t BlitSeqFullScreenArea = 320u * 200u;
+
+// Frame dumping: `sea2_hd_frame_dump = N` writes every Nth frame to
+// `sea2_frames/f_NNNNN.png`, which is the only way to tell which moment of a
+// trace shows the screen that is being investigated.
+int sea2_hd_frame_dump_interval = 0;
+uint32_t sea2_hd_frame_dumps    = 0;
+constexpr uint32_t FrameDumpMax = 240;
+
+void blit_seq(const char* format, ...)
+{
+	if (!sea2_hd_string_trace || blit_seq_lines >= BlitSeqMaxLines) {
+		return;
+	}
+	if (!blit_seq_file) {
+		blit_seq_file = std::fopen("sea2_blit_seq.txt", "w");
+		if (!blit_seq_file) {
+			return;
+		}
+	}
+	va_list args;
+	va_start(args, format);
+	std::vfprintf(blit_seq_file, format, args);
+	va_end(args);
+	std::fputc('\n', blit_seq_file);
+	++blit_seq_lines;
+	if ((blit_seq_lines & 0x3ff) == 0) {
+		std::fflush(blit_seq_file);
+	}
+}
+
+void blit_seq_add(uint16_t width, uint16_t height)
+{
+	if (!sea2_hd_string_trace) {
+		return;
+	}
+	++blit_seq_total;
+	++blit_seq_shapes[(static_cast<uint32_t>(width) << 16) | height];
+}
+
+// Runs once per host frame, before the next one is painted. Only the shapes
+// that make up the frame are listed, most frequent first, so a 16x16 tile grid
+// is immediately recognisable and a single 640x480 rectangle even more so.
+// Frames that painted nothing are skipped, which keeps the log small; a screen
+// that is only painted once still shows up in exactly the frame it appears.
+void blit_seq_flush_frame()
+{
+	if (!sea2_hd_string_trace) {
+		return;
+	}
+	if (blit_seq_total == 0 && blit_seq_string_ops == 0) {
+		return;
+	}
+	const uint32_t total = blit_seq_total;
+	blit_seq_total       = 0;
+
+	std::vector<std::pair<uint32_t, uint32_t>> shapes;
+	shapes.reserve(blit_seq_shapes.size());
+	for (const auto& entry : blit_seq_shapes) {
+		shapes.emplace_back(entry.second, entry.first);
+	}
+	blit_seq_shapes.clear();
+	std::sort(shapes.begin(), shapes.end(),
+	          [](const auto& a, const auto& b) { return a.first > b.first; });
+
+	bool full_screen = false;
+	std::string text;
+	char item[64] = {};
+	size_t listed = 0;
+	for (const auto& entry : shapes) {
+		const uint16_t w = static_cast<uint16_t>(entry.second >> 16);
+		const uint16_t h = static_cast<uint16_t>(entry.second & 0xffff);
+		if (static_cast<uint32_t>(w) * h >= BlitSeqFullScreenArea) {
+			full_screen = true;
+		}
+		if (listed >= 14) {
+			continue;
+		}
+		++listed;
+		snprintf(item, sizeof(item), "%s%ux%u:%u",
+		         text.empty() ? "" : ",", w, h, entry.first);
+		text += item;
+	}
+
+	std::string es_text = "-";
+	if (blit_seq_string_ops != 0) {
+		snprintf(item, sizeof(item), "%05x-%05x",
+		         static_cast<unsigned>(blit_seq_string_es_min),
+		         static_cast<unsigned>(blit_seq_string_es_max));
+		es_text = item;
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	if (blit_seq_clock_start == std::chrono::steady_clock::time_point{}) {
+		blit_seq_clock_start = now;
+	}
+	const double elapsed =
+	        std::chrono::duration<double>(now - blit_seq_clock_start).count();
+
+	blit_seq("FH f=%u t=%.1f n=%u fs=%u so=%u sb=%u es=%s s=%s",
+	         blit_seq_frames, elapsed, total, full_screen ? 1 : 0,
+	         blit_seq_string_ops, blit_seq_string_bytes, es_text.c_str(),
+	         text.c_str());
+
+	blit_seq_string_ops    = 0;
+	blit_seq_string_bytes  = 0;
+	blit_seq_string_es_min = 0xffffffffu;
+	blit_seq_string_es_max = 0;
+	blit_seq_string_max.clear();
+}
+
 void SEA2_HD_TraceGlyphSite(const uint16_t cs, const uint16_t ip)
 {
 	size_t slot = (static_cast<size_t>(cs) * 13u + static_cast<size_t>(ip) * 149u) %
@@ -3001,8 +3328,23 @@ void SEA2_HD_TraceStringOp(const uint16_t cs, const uint16_t ip, const uint16_t 
                            const uint16_t si, const uint16_t es, const uint16_t di,
                            const uint16_t cx, const uint8_t opcode)
 {
-	(void)es;
-	(void)cx;
+	// Only the instructions that write to ES:DI can build a screen, so just
+	// those are tallied per frame, together with where they write.
+	if (opcode == 0xa4 || opcode == 0xa5 || opcode == 0xaa || opcode == 0xab) {
+		const uint32_t bytes = static_cast<uint32_t>(cx) *
+		                       ((opcode == 0xa5 || opcode == 0xab) ? 2u : 1u);
+		const uint32_t phys = (static_cast<uint32_t>(es) << 4) + di;
+		++blit_seq_string_ops;
+		blit_seq_string_es_min = std::min(blit_seq_string_es_min, phys);
+		blit_seq_string_es_max = std::max(blit_seq_string_es_max, phys);
+		const uint32_t key = (static_cast<uint32_t>(cs) << 16) | ip;
+		uint32_t& seen    = blit_seq_string_max[key];
+		if (bytes > seen) {
+			blit_seq_string_bytes += bytes - seen;
+			seen = bytes;
+		}
+	}
+
 	size_t slot = (static_cast<size_t>(cs) * 31u + static_cast<size_t>(ip) * 7u +
 	               static_cast<size_t>(ds)) %
 	              StringOpTableSize;
@@ -3040,7 +3382,8 @@ void SEA2_HD_TraceBlit(const uint16_t ds, const uint16_t src, const uint16_t x,
                        const uint16_t y, const uint16_t width,
                        const uint16_t height, const uint16_t planes)
 {
-	(void)planes;
+	blit_seq_add(width, height);
+
 	size_t slot = (static_cast<size_t>(width) * 37u +
 	               static_cast<size_t>(height) * 101u) %
 	              BlitShapeTableSize;
@@ -3354,6 +3697,19 @@ void SEA2_HD_TraceBlitterEntry(const uint16_t ip)
 	        PhysicalMake(ss_seg, static_cast<uint16_t>(sp + 2)));
 	const bool text_caller =
 	        ret_ip == 0x4842 && ret_cs == sea2_hd_trace_loadseg;
+
+	if (sea2_hd_string_trace) {
+		// Arguments sit above the return address because the hook runs before
+		// the prologue's `push bp`. The 2x14 glyph blits are already described
+		// by the text pipeline, so only the others are worth a line here.
+		const uint16_t sx = mem_readw(PhysicalMake(ss_seg, sp + 4));
+		const uint16_t sy = mem_readw(PhysicalMake(ss_seg, sp + 6));
+		const uint16_t sw = mem_readw(PhysicalMake(ss_seg, sp + 8));
+		const uint16_t sh = mem_readw(PhysicalMake(ss_seg, sp + 10));
+		if (sw != 2 || sh != 14) {
+			blit_seq_add(sw, sh);
+		}
+	}
 
 	if (hd_enabled) {
 		// Arguments sit above the return address because the hook runs
@@ -3944,12 +4300,1612 @@ bool SEA2_HD_NeedsFrame()
 
 void SEA2_HD_AdvanceFrame()
 {
+	blit_seq_flush_frame();
+	++blit_seq_frames;
 	if (sea2_hd_string_trace) {
 		if (++string_op_frames >= StringOpDumpInterval) {
 			string_op_frames = 0;
 			SEA2_HD_DumpStringTrace();
 		}
 	}
+}
+
+void SEA2_HD_SetFrameDump(const int interval)
+{
+	sea2_hd_frame_dump_interval = std::max(interval, 0);
+	sea2_hd_frame_dumps         = 0;
+	if (sea2_hd_frame_dump_interval > 0) {
+		LOG_MSG("SEA2HD: dumping every %dth frame into sea2_frames/",
+		        sea2_hd_frame_dump_interval);
+	}
+}
+
+// The frame is handed over in the very same 32-bit BGRX layout that is
+// composited, so the dump shows exactly what the game put on screen.
+void SEA2_HD_DumpFrame(const void* pixels, const int pitch, const int width,
+                       const int height)
+{
+	if (sea2_hd_frame_dump_interval <= 0 || !pixels || width != VgaWidth ||
+	    height != VgaHeight || sea2_hd_frame_dumps >= FrameDumpMax) {
+		return;
+	}
+
+	const auto frame = blit_seq_frames;
+	if (frame % static_cast<uint32_t>(sea2_hd_frame_dump_interval) != 0) {
+		return;
+	}
+	++sea2_hd_frame_dumps;
+
+	auto* surface = SDL_CreateRGBSurfaceWithFormat(
+	        0, width, height, 32, SDL_PIXELFORMAT_RGBA32);
+	if (!surface) {
+		return;
+	}
+
+	if (SDL_LockSurface(surface) == 0) {
+		for (int y = 0; y < height; ++y) {
+			auto* out = static_cast<uint8_t*>(surface->pixels) +
+			            static_cast<size_t>(y) * surface->pitch;
+			const auto* in = static_cast<const uint8_t*>(pixels) +
+			                 static_cast<size_t>(y) * pitch;
+			for (int x = 0; x < width; ++x) {
+				out[x * 4 + 0] = in[x * 4 + 2];
+				out[x * 4 + 1] = in[x * 4 + 1];
+				out[x * 4 + 2] = in[x * 4 + 0];
+				out[x * 4 + 3] = 0xff;
+			}
+		}
+		SDL_UnlockSurface(surface);
+
+		std::filesystem::create_directories("sea2_frames");
+		char name[64] = {};
+		std::snprintf(name, sizeof(name), "sea2_frames/f_%05u.png",
+		              static_cast<unsigned>(frame));
+		IMG_SavePNG(surface, name);
+	}
+	SDL_FreeSurface(surface);
+}
+
+// The port is drawn with a 16 colour palette that the game swaps as the day
+// passes. Those colours come out of the VGA's six bit per channel DAC, so the two
+// low bits are rounding only and are dropped here: a colour of the reference map
+// and the same colour in the frame then compare equal whichever time of day
+// produced them.
+uint32_t port_colour(const uint32_t rgb)
+{
+	return (((rgb >> 18) & 0x3f) << 12) | (((rgb >> 10) & 0x3f) << 6) |
+	       ((rgb >> 2) & 0x3f);
+}
+
+// One hash per 16x16 cell. Both the map and the window are grid aligned, so a
+// cell either is exactly that tile or it is not, and a window full of them pins
+// the offset to the tile without any tolerance to tune.
+uint64_t hash_port_cell(const uint32_t* pixels, const int stride)
+{
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (int y = 0; y < PortMapStep; ++y) {
+		const auto* row = pixels + static_cast<size_t>(y) * stride;
+		for (int x = 0; x < PortMapStep; ++x) {
+			hash = (hash ^ port_colour(row[x])) * 0x100000001b3ull;
+		}
+	}
+	return hash;
+}
+
+void hash_port_window(const uint32_t* source, const int source_width,
+                      std::array<uint64_t, PortMapCellCount>& window)
+{
+	for (int ty = 0; ty < PortMapCells; ++ty) {
+		for (int tx = 0; tx < PortMapCells; ++tx) {
+			window[ty * PortMapCells + tx] = hash_port_cell(
+			        source +
+			                static_cast<size_t>(PortMapWindowY + ty * PortMapStep) *
+			                        source_width +
+			                PortMapWindowX + tx * PortMapStep,
+			        source_width);
+		}
+	}
+}
+
+// The same cell, described by which of its neighbouring pixels are the same
+// colour instead of by the colours themselves. A palette is a function of the
+// colour index, so a fade can only turn a pair of different pixels into an equal
+// one: every bit that is set here stays set while the screen fades in, which is
+// what makes the cell recognisable before its palette has arrived.
+void port_cell_relations(const uint32_t* pixels, const int stride,
+                         std::array<uint64_t, PortMapRelationWords>& relations)
+{
+	relations.fill(0);
+	const auto set_equal = [&relations](const int bit, const uint32_t a,
+	                                    const uint32_t b) {
+		if ((a & 0x00ffffffu) == (b & 0x00ffffffu)) {
+			relations[static_cast<size_t>(bit) / 64] |= 1ull << (bit % 64);
+		}
+	};
+	for (int y = 0; y < PortMapStep; ++y) {
+		const auto* row = pixels + static_cast<size_t>(y) * stride;
+		for (int x = 0; x < PortMapStep - 1; ++x) {
+			set_equal(y * (PortMapStep - 1) + x, row[x], row[x + 1]);
+		}
+	}
+	for (int y = 0; y < PortMapStep - 1; ++y) {
+		const auto* row   = pixels + static_cast<size_t>(y) * stride;
+		const auto* below = row + stride;
+		for (int x = 0; x < PortMapStep; ++x) {
+			set_equal(PortMapRightBits + y * PortMapStep + x, row[x], below[x]);
+		}
+	}
+}
+
+uint64_t hash_port_relations(
+        const std::array<uint64_t, PortMapRelationWords>& relations)
+{
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (const auto word : relations) {
+		hash = (hash ^ word) * 0x100000001b3ull;
+	}
+	return hash;
+}
+
+void hash_port_window_relations(const uint32_t* source, const int source_width,
+                                std::array<uint64_t, PortMapCellCount>& window)
+{
+	std::array<uint64_t, PortMapRelationWords> relations = {};
+	for (int ty = 0; ty < PortMapCells; ++ty) {
+		for (int tx = 0; tx < PortMapCells; ++tx) {
+			port_cell_relations(
+			        source +
+			                static_cast<size_t>(PortMapWindowY + ty * PortMapStep) *
+			                        source_width +
+			                PortMapWindowX + tx * PortMapStep,
+			        source_width, relations);
+			window[ty * PortMapCells + tx] = hash_port_relations(relations);
+		}
+	}
+}
+
+// How many cells of the window show the very tile the map has at that offset.
+int score_port_offset(
+        const std::array<uint64_t, PortMapGridSize * PortMapGridSize>& cells,
+        const int step_x, const int step_y,
+        const std::array<uint64_t, PortMapCellCount>& window)
+{
+	int same = 0;
+	for (int ty = 0; ty < PortMapCells; ++ty) {
+		const auto* row = cells.data() +
+		                  static_cast<size_t>(step_y + ty) * PortMapGridSize +
+		                  step_x;
+		for (int tx = 0; tx < PortMapCells; ++tx) {
+			same += row[tx] == window[ty * PortMapCells + tx] ? 1 : 0;
+		}
+	}
+	return same;
+}
+
+// The same score, but the cells the game painted a panel over are left out: a
+// message box can hide more than half of the port, and the part that is still
+// the map has to decide on its own. Panels cover a large flat area, so they are
+// found without knowing where the game put the box - see port_panel_mask().
+int score_port_offset_with_panels(
+        const std::array<uint64_t, PortMapGridSize * PortMapGridSize>& cells,
+        const int step_x, const int step_y,
+        const std::array<uint64_t, PortMapCellCount>& window,
+        const uint8_t* panel, int& panels_out)
+{
+	int same   = 0;
+	int panels = 0;
+	for (int ty = 0; ty < PortMapCells; ++ty) {
+		const auto* row = cells.data() +
+		                  static_cast<size_t>(step_y + ty) * PortMapGridSize +
+		                  step_x;
+		for (int tx = 0; tx < PortMapCells; ++tx) {
+			int paper = 0;
+			for (int y = 0; y < PortMapStep; ++y) {
+				const auto* line = panel +
+				                   static_cast<size_t>(ty * PortMapStep + y) *
+				                           PortMapWindowSize +
+				                   tx * PortMapStep;
+				for (int x = 0; x < PortMapStep; ++x) {
+					paper += (line[x] & 3) == 3 ? 1 : 0;
+				}
+			}
+			if (paper >= PortMapPanelCellPixels) {
+				++panels;
+				continue;
+			}
+			same += row[tx] == window[ty * PortMapCells + tx] ? 1 : 0;
+		}
+	}
+	panels_out = panels;
+	return same;
+}
+
+// The cell whose picture repeats in the fewest places pins the offset; every
+// place that picture appears is tried and the whole window decides.
+bool locate_port_map(
+        const std::array<uint64_t, PortMapGridSize * PortMapGridSize>& cells,
+        const std::unordered_map<uint64_t, std::vector<uint16_t>>& index,
+        const int min_cells,
+        const std::array<uint64_t, PortMapCellCount>& window,
+        const int keep_step_x, const int keep_step_y, int& step_x, int& step_y,
+        int& best_score_out, int& known_out)
+{
+	auto anchor         = -1;
+	auto anchor_repeats = PortMapAnchorMax + 1;
+	known_out           = 0;
+	for (int i = 0; i < PortMapCellCount; ++i) {
+		const auto it = index.find(window[static_cast<size_t>(i)]);
+		if (it == index.end()) {
+			continue;
+		}
+		++known_out;
+		if (it->second.size() < anchor_repeats) {
+			anchor         = i;
+			anchor_repeats = it->second.size();
+			if (anchor_repeats == 1) {
+				break;
+			}
+		}
+	}
+	if (anchor < 0) {
+		best_score_out = -1;
+		return false;
+	}
+
+	const auto anchor_step_x = anchor % PortMapCells;
+	const auto anchor_step_y = anchor / PortMapCells;
+	int best_score           = -1;
+	int best_x               = 0;
+	int best_y               = 0;
+	const auto& places =
+	        index.find(window[static_cast<size_t>(anchor)])->second;
+	for (const auto cell : places) {
+		const auto x = static_cast<int>(cell) % PortMapGridSize - anchor_step_x;
+		const auto y = static_cast<int>(cell) / PortMapGridSize - anchor_step_y;
+		if (x < 0 || y < 0 || x > PortMapOffsetSteps || y > PortMapOffsetSteps) {
+			continue;
+		}
+		const auto score = score_port_offset(cells, x, y, window);
+		const auto keeps = x == keep_step_x && y == keep_step_y;
+		// A picture that repeats leaves several offsets equally good; staying
+		// where it was keeps the artwork from jumping between them.
+		if (score > best_score || (score == best_score && keeps)) {
+			best_score = score;
+			best_x     = x;
+			best_y     = y;
+		}
+	}
+	best_score_out = best_score;
+	if (best_score < min_cells) {
+		return false;
+	}
+	step_x = best_x;
+	step_y = best_y;
+	return true;
+}
+
+// Writes what the game shows and what was composited over it for the very same
+// frame, so a region that stays low resolution can be told apart from one that
+// was drawn at the wrong place.
+void diag_port_cells(const uint32_t* source, const int source_width,
+                     const uint32_t* destination, const int destination_stride,
+                     const char* states)
+{
+	const auto started = port_map_diags++;
+	diag("PORTCELLS frame=%u off=%d,%d", composite_count, port_map_offset_x,
+	     port_map_offset_y);
+	for (int ty = 0; ty < PortMapCells; ++ty) {
+		char row_text[PortMapCells + 1] = {};
+		std::memcpy(row_text, states + ty * PortMapCells, PortMapCells);
+		diag("PORTCELLS %s", row_text);
+	}
+
+	std::filesystem::create_directories("sea2_portcell");
+	char name[96] = {};
+	std::snprintf(name, sizeof(name), "sea2_portcell/f%05u_src.png", started);
+	auto* src = SDL_CreateRGBSurfaceWithFormat(0, PortMapWindowSize,
+	                                          PortMapWindowSize, 32,
+	                                          SDL_PIXELFORMAT_RGBA32);
+	if (src && SDL_LockSurface(src) == 0) {
+		for (int y = 0; y < PortMapWindowSize; ++y) {
+			auto* out = static_cast<uint8_t*>(src->pixels) +
+			            static_cast<size_t>(y) * src->pitch;
+			const auto* in = source +
+			                 static_cast<size_t>(PortMapWindowY + y) *
+			                         source_width +
+			                 PortMapWindowX;
+			for (int x = 0; x < PortMapWindowSize; ++x) {
+				out[x * 4 + 0] = static_cast<uint8_t>((in[x] >> 16) & 0xff);
+				out[x * 4 + 1] = static_cast<uint8_t>((in[x] >> 8) & 0xff);
+				out[x * 4 + 2] = static_cast<uint8_t>(in[x] & 0xff);
+				out[x * 4 + 3] = 0xff;
+			}
+		}
+		SDL_UnlockSurface(src);
+		IMG_SavePNG(src, name);
+	}
+	if (src) {
+		SDL_FreeSurface(src);
+	}
+
+	std::snprintf(name, sizeof(name), "sea2_portcell/f%05u_dst.png", started);
+	const auto size = PortMapWindowSize * HdScale;
+	auto* dst = SDL_CreateRGBSurfaceWithFormat(0, size, size, 32,
+	                                          SDL_PIXELFORMAT_RGBA32);
+	if (dst && SDL_LockSurface(dst) == 0) {
+		for (int y = 0; y < size; ++y) {
+			auto* out = static_cast<uint8_t*>(dst->pixels) +
+			            static_cast<size_t>(y) * dst->pitch;
+			const auto* in = destination +
+			                 static_cast<size_t>(PortMapWindowY * HdScale + y) *
+			                         destination_stride +
+			                 PortMapWindowX * HdScale;
+			for (int x = 0; x < size; ++x) {
+				out[x * 4 + 0] = static_cast<uint8_t>((in[x] >> 16) & 0xff);
+				out[x * 4 + 1] = static_cast<uint8_t>((in[x] >> 8) & 0xff);
+				out[x * 4 + 2] = static_cast<uint8_t>(in[x] & 0xff);
+				out[x * 4 + 3] = 0xff;
+			}
+		}
+		SDL_UnlockSurface(dst);
+		IMG_SavePNG(dst, name);
+	}
+	if (dst) {
+		SDL_FreeSurface(dst);
+	}
+}
+
+// How much of the window is black, sampled. A screen the game is still painting
+// is mostly black, one that is simply something else is not.
+int dark_pixels(const uint32_t* source, const int source_width)
+{
+	int dark = 0;
+	for (int y = 0; y < PortMapWindowSize; y += 8) {
+		const auto* row = source +
+		                  static_cast<size_t>(PortMapWindowY + y) * source_width +
+		                  PortMapWindowX;
+		for (int x = 0; x < PortMapWindowSize; x += 8) {
+			const auto colour = row[x];
+			dark += ((colour >> 16) & 0xff) + ((colour >> 8) & 0xff) +
+			                (colour & 0xff) <
+			        30;
+		}
+	}
+	return dark;
+}
+
+// Marks the pixels of the window the game painted a panel over. Only a pixel
+// that sits in a long flat run across *and* down is paper: every one of the
+// map's tiles is dithered, so the map never has such an area, while a message
+// box, a label or a menu is one colour over a large area.
+void port_panel_mask(const uint32_t* source, const int source_width,
+                     uint8_t* panel)
+{
+	std::memset(panel, 0,
+	            static_cast<size_t>(PortMapWindowSize) * PortMapWindowSize);
+	for (int y = 0; y < PortMapWindowSize; ++y) {
+		const auto* row = source +
+		                  static_cast<size_t>(PortMapWindowY + y) * source_width +
+		                  PortMapWindowX;
+		for (int x = 0; x < PortMapWindowSize;) {
+			const auto colour = row[x] & 0x00ffffffu;
+			auto end          = x + 1;
+			while (end < PortMapWindowSize &&
+			       (row[end] & 0x00ffffffu) == colour) {
+				++end;
+			}
+			if (end - x >= PortMapPanelRun) {
+				for (auto i = x; i < end; ++i) {
+					panel[static_cast<size_t>(y) * PortMapWindowSize + i] |= 1;
+				}
+			}
+			x = end;
+		}
+	}
+	for (int x = 0; x < PortMapWindowSize; ++x) {
+		const auto column = static_cast<size_t>(PortMapWindowX + x);
+		for (int y = 0; y < PortMapWindowSize;) {
+			const auto colour =
+			        source[static_cast<size_t>(PortMapWindowY + y) * source_width +
+			               column] &
+			        0x00ffffffu;
+			auto end = y + 1;
+			while (end < PortMapWindowSize &&
+			       (source[static_cast<size_t>(PortMapWindowY + end) *
+			                       source_width +
+			               column] &
+			        0x00ffffffu) == colour) {
+				++end;
+			}
+			if (end - y >= PortMapPanelRun) {
+				for (auto i = y; i < end; ++i) {
+					panel[static_cast<size_t>(i) * PortMapWindowSize + x] |= 2;
+				}
+			}
+			y = end;
+		}
+	}
+}
+
+// Saves the 384x384 map window of a frame, used to look at the frames in which
+// the map was not replaced.
+void dump_port_window(const uint32_t* source, const int source_width,
+                      const char* path)
+{
+	auto* surface = SDL_CreateRGBSurfaceWithFormat(0, PortMapWindowSize,
+	                                              PortMapWindowSize, 32,
+	                                              SDL_PIXELFORMAT_RGBA32);
+	if (!surface) {
+		return;
+	}
+	if (SDL_LockSurface(surface) == 0) {
+		for (int y = 0; y < PortMapWindowSize; ++y) {
+			auto* out = static_cast<uint8_t*>(surface->pixels) +
+			            static_cast<size_t>(y) * surface->pitch;
+			const auto* in = source +
+			                 static_cast<size_t>(PortMapWindowY + y) *
+			                         source_width +
+			                 PortMapWindowX;
+			for (int x = 0; x < PortMapWindowSize; ++x) {
+				out[x * 4 + 0] = static_cast<uint8_t>((in[x] >> 16) & 0xff);
+				out[x * 4 + 1] = static_cast<uint8_t>((in[x] >> 8) & 0xff);
+				out[x * 4 + 2] = static_cast<uint8_t>(in[x] & 0xff);
+				out[x * 4 + 3] = 0xff;
+			}
+		}
+		SDL_UnlockSurface(surface);
+		IMG_SavePNG(surface, path);
+	}
+	SDL_FreeSurface(surface);
+}
+
+// The game fades its screen out whenever it leaves the map, so for a few frames
+// the window is a darker copy of it rather than an exact one. Such a window is
+// still the map, and the fade is a darkening of the palette - often with every
+// other pixel already black - so the pixels that are black carry no information
+// about the scale and are left out. One brightness per channel is fitted on the
+// rest.
+bool port_map_fit_gain(const PortMap& map, const int step_x, const int step_y,
+                       const uint32_t* source, const int source_width,
+                       std::array<float, 3>& scale)
+{
+	const auto lit = [](const uint32_t colour) {
+		return ((colour >> 16) & 0xff) + ((colour >> 8) & 0xff) +
+		               (colour & 0xff) >=
+		       30;
+	};
+
+	double source_sum[3]   = {0.0, 0.0, 0.0};
+	double expected_sum[3] = {0.0, 0.0, 0.0};
+	int fitted             = 0;
+	for (int y = 0; y < PortMapWindowSize; y += 4) {
+		const auto* row = source +
+		                  static_cast<size_t>(PortMapWindowY + y) * source_width +
+		                  PortMapWindowX;
+		const auto* expected = map.pixels.data() +
+		                       static_cast<size_t>(step_y * PortMapStep + y) *
+		                               PortMapSize +
+		                       step_x * PortMapStep;
+		for (int x = 0; x < PortMapWindowSize; x += 4) {
+			const auto actual = row[x];
+			const auto want   = expected[x];
+			if (!lit(actual) || !lit(want)) {
+				continue;
+			}
+			source_sum[0] += (actual >> 16) & 0xff;
+			source_sum[1] += (actual >> 8) & 0xff;
+			source_sum[2] += actual & 0xff;
+			expected_sum[0] += (want >> 16) & 0xff;
+			expected_sum[1] += (want >> 8) & 0xff;
+			expected_sum[2] += want & 0xff;
+			++fitted;
+		}
+	}
+	if (fitted < 60) {
+		return false;
+	}
+
+	for (auto i = 0; i < 3; ++i) {
+		const auto channel = static_cast<size_t>(i);
+		if (expected_sum[channel] < 1.0) {
+			return false;
+		}
+		const auto ratio = static_cast<float>(source_sum[channel] /
+		                                      expected_sum[channel]);
+		if (ratio < 0.10f || ratio > 4.0f) {
+			return false;
+		}
+		scale[channel] = ratio;
+	}
+	return true;
+}
+
+// The game paints the whole port with one palette, so each of the handful of
+// colours the map is made of turns into exactly one colour on screen. Which one
+// is read off the window itself: within the cells whose equality pattern is the
+// map's - they cannot hold the character or a dialog - the screen colour that
+// owns a map colour is the one the palette produced from it. That mapping is
+// exact whatever the palette is, so no fade and no time of day between the
+// stored ones has to be guessed at.
+//
+// One stored colour can be sent to two screen colours: the four times of day
+// were read off screenshots, and two entries of the game's palette that looked
+// alike there are told apart again by a palette that fades in between. The map
+// dithers those two entries in an even pattern, so whenever the split is even
+// both halves are adopted; a dialog or the character instead leaves one large
+// and one small part, and such a colour is still refused.
+//
+// The cells are only consulted when the window's pattern is the map's. A
+// trusted offset - the frame before drew the port at it - skips that test and
+// reads the palette off every pixel of the window instead, because a palette
+// that fades to black makes neighbouring colours equal and breaks the pattern
+// while the port is still there.
+bool measure_port_palette(const PortMap& map, const int step_x, const int step_y,
+                          const std::array<uint64_t, PortMapCellCount>& window,
+                          const uint32_t* source, const int source_width,
+                          std::vector<std::pair<uint32_t, uint32_t>>& pairs,
+                          const bool whole_window = false)
+{
+	std::unordered_map<uint32_t, std::unordered_map<uint32_t, int>> seen = {};
+	const auto sample_step                                               = 4;
+	const auto* panel = port_map_panel_ready ? port_map_panel.data() : nullptr;
+	for (int ty = 0; ty < PortMapCells; ++ty) {
+		for (int tx = 0; tx < PortMapCells; ++tx) {
+			const auto cell = (step_y + ty) * PortMapGridSize + step_x + tx;
+			if (!whole_window &&
+			    window[ty * PortMapCells + tx] !=
+			            map.relation_hashes[static_cast<size_t>(cell)]) {
+				continue;
+			}
+			const auto source_x = PortMapWindowX + tx * PortMapStep;
+			const auto source_y = PortMapWindowY + ty * PortMapStep;
+			const auto* map_x0 =
+			        map.pixels.data() +
+			        static_cast<size_t>(step_y * PortMapStep + ty * PortMapStep) *
+			                        PortMapSize +
+			        (step_x + tx) * PortMapStep;
+			for (int y = 0; y < PortMapStep; y += sample_step) {
+				const auto* row = source +
+				                  static_cast<size_t>(source_y + y) *
+				                          source_width +
+				                  source_x;
+				const auto* expected =
+				        map_x0 + static_cast<size_t>(y) * PortMapSize;
+				const auto* mask = panel == nullptr
+				                           ? nullptr
+				                           : panel +
+				                                     static_cast<size_t>(
+				                                             ty * PortMapStep + y) *
+				                                             PortMapWindowSize +
+				                                     tx * PortMapStep;
+				for (int x = 0; x < PortMapStep; x += sample_step) {
+					if (mask != nullptr && (mask[x] & 3) == 3) {
+						continue;
+					}
+					++seen[expected[x] & 0x00ffffffu][row[x] & 0x00ffffffu];
+				}
+			}
+		}
+	}
+
+	// The mapping is only replaced by a frame that really produced one. A single
+	// unreadable frame would otherwise drop the drawing back onto the other path
+	// and the port would change its brightness for that frame, which is exactly
+	// what flickers while the character walks.
+	std::vector<std::pair<uint32_t, uint32_t>> measured = {};
+	auto sampled                                        = 0;
+	auto explained                                      = 0;
+	for (const auto& [colour, screens] : seen) {
+		auto total       = 0;
+		auto best        = 0;
+		auto best_colour = 0u;
+		auto next        = 0;
+		auto next_colour = 0u;
+		for (const auto& [screen, count] : screens) {
+			total += count;
+			if (count > best) {
+				next        = best;
+				next_colour = best_colour;
+				best        = count;
+				best_colour = screen;
+			} else if (count > next) {
+				next        = count;
+				next_colour = screen;
+			}
+		}
+		sampled += total;
+		// A colour mostly given to something else is not the palette's doing.
+		if (best * 4 >= total * 3) {
+			measured.emplace_back(colour, best_colour);
+			explained += best;
+			continue;
+		}
+		// Two entries of the map's palette that share this colour in the stored
+		// picture, told apart again by the palette of this frame.
+		if (next * 100 >= total * 30 && (best + next) * 100 >= total * 90) {
+			measured.emplace_back(colour, best_colour);
+			measured.emplace_back(colour, next_colour);
+			explained += best + next;
+		}
+	}
+	if (measured.empty()) {
+		return false;
+	}
+	// A window that was not checked cell by cell has to be explained by the
+	// mapping almost completely, or it is not the port at that offset.
+	if (whole_window) {
+		if (explained * 100 < sampled * PortMapBridgeExplainedPercent) {
+			return false;
+		}
+		// A screen that has already gone black holds a single colour, so nothing
+		// of the map can be told apart any more and drawing there would invent
+		// detail the game does not show.
+		auto distinct = std::vector<uint32_t>{};
+		for (const auto& [colour, screen] : measured) {
+			static_cast<void>(colour);
+			if (std::find(distinct.begin(), distinct.end(), screen) ==
+			    distinct.end()) {
+				distinct.push_back(screen);
+			}
+		}
+		if (distinct.size() < PortMapBridgeMinColours) {
+			return false;
+		}
+	}
+	std::sort(measured.begin(), measured.end());
+	pairs = std::move(measured);
+	return true;
+}
+
+// The fitted brightness is only trusted when almost every pixel agrees with it.
+bool port_map_scaled(const PortMap& map, const int step_x, const int step_y,
+                     const uint32_t* source, const int source_width,
+                     std::array<float, 3>& scale)
+{
+	const auto lit = [](const uint32_t colour) {
+		return ((colour >> 16) & 0xff) + ((colour >> 8) & 0xff) +
+		               (colour & 0xff) >=
+		       30;
+	};
+
+	if (!port_map_fit_gain(map, step_x, step_y, source, source_width, scale)) {
+		return false;
+	}
+
+	int agree  = 0;
+	int looked = 0;
+	for (int y = 0; y < PortMapWindowSize; y += 4) {
+		const auto* row = source +
+		                  static_cast<size_t>(PortMapWindowY + y) * source_width +
+		                  PortMapWindowX;
+		const auto* expected = map.pixels.data() +
+		                       static_cast<size_t>(step_y * PortMapStep + y) *
+		                               PortMapSize +
+		                       step_x * PortMapStep;
+		for (int x = 0; x < PortMapWindowSize; x += 4) {
+			const auto actual = row[x];
+			const auto want   = expected[x];
+			if (!lit(actual) || !lit(want)) {
+				continue;
+			}
+			const auto dr = static_cast<int>((actual >> 16) & 0xff) -
+			                std::min(255,
+			                         static_cast<int>(((want >> 16) & 0xff) *
+			                                          scale[0]));
+			const auto dg = static_cast<int>((actual >> 8) & 0xff) -
+			                std::min(255,
+			                         static_cast<int>(((want >> 8) & 0xff) *
+			                                          scale[1]));
+			const auto db = static_cast<int>(actual & 0xff) -
+			                std::min(255,
+			                         static_cast<int>((want & 0xff) * scale[2]));
+			++looked;
+			if (dr >= -14 && dr <= 14 && dg >= -14 && dg <= 14 && db >= -14 &&
+			    db <= 14) {
+				++agree;
+			}
+		}
+	}
+	return looked >= 60 && agree * 100 >= looked * 90;
+}
+
+// Decides for this frame whether the window shows a map, and where. The map and
+// its offset are remembered while something else is on screen (a building, a
+// shop, a dialog), so walking back out needs no search at all.
+void update_port_map(const uint32_t* source, const int source_width)
+{
+	if (port_maps.empty()) {
+		return;
+	}
+
+	std::array<uint64_t, PortMapCellCount> window = {};
+	hash_port_window(source, source_width, window);
+
+	const auto selected = port_map_selected;
+	const auto keep_x   = port_map_offset_x / PortMapStep;
+	const auto keep_y   = port_map_offset_y / PortMapStep;
+
+	port_map_visible  = false;
+	port_map_fade     = {1.0f, 1.0f, 1.0f};
+	port_map_measured = false;
+	port_map_panel_ready = false;
+	std::array<uint64_t, PortMapCellCount> relation_window = {};
+	bool relation_window_ready                              = false;
+	const auto relation_window_of =
+	        [&]() -> const std::array<uint64_t, PortMapCellCount>& {
+		if (!relation_window_ready) {
+			hash_port_window_relations(source, source_width, relation_window);
+			relation_window_ready = true;
+		}
+		return relation_window;
+	};
+	int keep_score      = -1;
+	int relation_keep   = -1;
+	bool scaled_ok      = false;
+	std::array<float, 3> scale = {};
+	if (selected >= 0) {
+		const auto& map = port_maps[static_cast<size_t>(selected)];
+		keep_score      = score_port_offset(map.cells, keep_x, keep_y, window);
+		if (keep_score >= PortMapKeepCells) {
+			// The window is the map and its palette is the stored one, but the
+			// same drawing is used here as for every other palette: the artwork
+			// keeps the colour the game shows and only adds its own detail, so
+			// the port neither brightens nor changes its look between frames.
+			port_map_visible  = true;
+			port_map_measured = measure_port_palette(
+			                           map, keep_x, keep_y,
+			                           relation_window_of(), source, source_width,
+			                           port_map_palette_pairs) ||
+			                    !port_map_palette_pairs.empty();
+			return;
+		}
+
+		// A fade out keeps the very same map on screen, only darker, so the
+		// artwork is dimmed with it instead of handing the window back to the
+		// game's own pixels until the fade is over.
+		scaled_ok = port_map_scaled(map, keep_x, keep_y, source, source_width,
+		                            scale);
+
+		if (scaled_ok) {
+			// A fade is a palette that got darker entry by entry, so the same
+			// measurement describes it exactly; the fitted brightness is only
+			// the fallback for a frame it cannot describe.
+			port_map_visible  = true;
+			port_map_fade     = scale;
+			port_map_measured = measure_port_palette(
+			                           map, keep_x, keep_y,
+			                           relation_window_of(), source, source_width,
+			                           port_map_palette_pairs) ||
+			                    !port_map_palette_pairs.empty();
+			return;
+		}
+
+		// The palette is neither the stored one nor a darkening of it: the game
+		// fades its palette in entry by entry, and between the stored times of day
+		// it blends them. The picture is complete all the same, so the window is
+		// checked once more by the equality pattern of its cells, which such a
+		// palette cannot change.
+		const auto relation_keep_score = score_port_offset(
+		        map.relation_hashes, keep_x, keep_y, relation_window_of());
+		relation_keep = relation_keep_score;
+		if (relation_keep_score >= PortMapKeepCells) {
+			port_map_visible  = true;
+			port_map_measured = measure_port_palette(
+			                           map, keep_x, keep_y,
+			                           relation_window_of(), source, source_width,
+			                           port_map_palette_pairs) ||
+			                    !port_map_palette_pairs.empty();
+			if (port_map_rel_logs < 40) {
+				++port_map_rel_logs;
+				diag("PORTREL keep x=%d y=%d score=%d colours=%zu frame=%u",
+				     port_map_offset_x, port_map_offset_y, relation_keep_score,
+				     port_map_palette_pairs.size(), composite_count);
+				if (port_map_rel_logs <= 8) {
+					std::string line = {};
+					for (const auto& [colour, screen] :
+					     port_map_palette_pairs) {
+						char item[32] = {};
+						std::snprintf(item, sizeof(item), " %06x>%06x", colour,
+						              screen);
+						line += item;
+					}
+					diag("PORTRELMAP%s", line.c_str());
+				}
+			}
+			return;
+		}
+
+		// A message box the game opens over the port covers a large flat area,
+		// and then neither the colours nor the equality pattern of the whole
+		// window describe the map any more, even though the port has not moved.
+		// The paper is recognised and left out, and the part of the window that
+		// is still the map decides on its own - with the very colours of this
+		// frame, so nothing is drawn brighter or darker than the game shows it.
+		port_panel_mask(source, source_width, port_map_panel.data());
+		port_map_panel_ready = true;
+		int panels = 0;
+		auto visible_cells = score_port_offset_with_panels(
+		        map.cells, keep_x, keep_y, window, port_map_panel.data(),
+		        panels);
+		auto panels_by_relations = false;
+		if (panels >= PortMapPanelMinCells && panels <= PortMapPanelMaxCells) {
+			const auto rest  = PortMapCellCount - panels;
+			const auto needs = (rest * PortMapPanelKeepPercent) / 100;
+			if (visible_cells < needs) {
+				visible_cells = score_port_offset_with_panels(
+				        map.relation_hashes, keep_x, keep_y,
+				        relation_window_of(), port_map_panel.data(), panels);
+				panels_by_relations = true;
+			}
+			// Drawing a frame that a box partly covers is only safe with the
+			// colours read off this very frame: the mapping of the frame before
+			// can be brighter than the screen and would show as a flash.
+			if (visible_cells >= needs &&
+			    measure_port_palette(map, keep_x, keep_y, relation_window_of(),
+			                         source, source_width,
+			                         port_map_palette_pairs)) {
+				port_map_visible  = true;
+				port_map_measured = true;
+				if (port_map_rel_logs < 40) {
+					++port_map_rel_logs;
+					diag("PORTPANEL keep x=%d y=%d panels=%d score=%d rest=%d rel=%d frame=%u",
+					     port_map_offset_x, port_map_offset_y, panels,
+					     visible_cells, rest, panels_by_relations ? 1 : 0,
+					     composite_count);
+				}
+				return;
+			}
+		}
+		// The game fades its whole palette out on its way into a building, and on
+		// the way to black the entries collapse: colours the stored map keeps
+		// apart become one, the equality pattern of the cells changes and the
+		// port is no longer recognised although it is plainly still on screen.
+		// It cannot move while the palette fades, so the offset of the frame
+		// before is kept and the palette is read off the whole window - a screen
+		// that already went all the way to black is refused by that measurement
+		// itself, because it holds a single colour and no detail of the port can
+		// be told apart in it. A building or a shop does not share the pattern at
+		// all and is still left alone.
+		if (port_map_drew_last && relation_keep >= PortMapBridgeMinCells &&
+		    measure_port_palette(map, keep_x, keep_y, relation_window_of(),
+		                         source, source_width, port_map_palette_pairs,
+		                         true)) {
+			port_map_visible  = true;
+			port_map_measured = true;
+			if (port_map_fade_logs < PortMapDiagCount) {
+				++port_map_fade_logs;
+				diag("PORTFADE keep x=%d y=%d rel=%d colours=%zu dark=%d frame=%u",
+				     port_map_offset_x, port_map_offset_y, relation_keep,
+				     port_map_palette_pairs.size(),
+				     dark_pixels(source, source_width), composite_count);
+			}
+			return;
+		}
+	}
+
+	if (port_map_retry > 0) {
+		--port_map_retry;
+		return;
+	}
+
+	int best_any  = -1;
+	int known_any = 0;
+	for (auto i = 0; i < static_cast<int>(port_maps.size()); ++i) {
+		const auto& map   = port_maps[static_cast<size_t>(i)];
+		const auto repeat = i == selected;
+		int step_x        = 0;
+		int step_y        = 0;
+		int best          = -1;
+		int known         = 0;
+		auto found        = locate_port_map(
+		        map.cells, map.cell_index, PortMapMinCells, window,
+		        repeat ? keep_x : -1, repeat ? keep_y : -1, step_x, step_y, best,
+		        known);
+
+		// The colours of a window that is still fading in match nothing, but the
+		// equality pattern of its cells already is the map's, so the same search is
+		// run once more on that pattern before the frame is given up on.
+		auto relations = false;
+		if (!found) {
+			found = locate_port_map(
+			        map.relation_hashes, map.relation_index,
+			        PortMapRelationMinCells, relation_window_of(),
+			        repeat ? keep_x : -1, repeat ? keep_y : -1, step_x, step_y,
+			        best, known);
+			relations = found;
+		}
+		if (!found) {
+			if (best > best_any) {
+				best_any  = best;
+				known_any = known;
+			}
+			continue;
+		}
+		if (port_map_selected != i) {
+			// Another port: a mapping read off the previous one says nothing
+			// about the colours of this one.
+			port_map_palette_pairs.clear();
+		}
+		port_map_selected  = i;
+		port_map_offset_x  = step_x * PortMapStep;
+		port_map_offset_y  = step_y * PortMapStep;
+		port_map_visible   = true;
+		// The window is drawn the same way whichever test found it: the palette
+		// is read off the frame itself, so the port keeps exactly one brightness
+		// and cannot flash when the search and the kept offset take turns.
+		port_map_measured = measure_port_palette(
+		                           map, step_x, step_y, relation_window_of(),
+		                           source, source_width,
+		                           port_map_palette_pairs) ||
+		                    !port_map_palette_pairs.empty();
+		if (relations) {
+			// The colours of the window are not the stored map's, because the game
+			// either fades its palette in or uses a time of day between the stored
+			// ones. The palette is therefore read off the frame itself, and the
+			// artwork is drawn with those very colours.
+			if (port_map_rel_logs < 40) {
+				++port_map_rel_logs;
+				diag("PORTREL entry=%u x=%d y=%d score=%d colours=%zu frame=%u",
+				     map.index, port_map_offset_x, port_map_offset_y, best,
+				     port_map_palette_pairs.size(), composite_count);
+			}
+		} else if (repeat) {
+			diag("PORTMAP scroll %d,%d -> %d,%d frame=%u", keep_x * PortMapStep,
+			     keep_y * PortMapStep, port_map_offset_x, port_map_offset_y,
+			     composite_count);
+		} else {
+			LOG_MSG("SEA2HD: Port map %u at tile %d,%d", map.index, step_x,
+			        step_y);
+			diag("PORTMAP entry=%u x=%d y=%d frame=%u", map.index,
+			     port_map_offset_x, port_map_offset_y, composite_count);
+		}
+		return;
+	}
+
+	// The map that was drawn a moment ago is gone: this is the frame that shows
+	// in the game's own resolution. It is logged and written out once per
+	// transition, so a flash that is still seen can be looked at directly.
+	if (port_map_drew_last) {
+		if (port_map_loss_logs < 40) {
+			++port_map_loss_logs;
+			diag("PORTDROP frame=%u off=%d,%d score=%d rel=%d scaled=%d fit=%.3f/%.3f/%.3f dark=%d best=%d known=%d",
+			     composite_count, keep_x * PortMapStep, keep_y * PortMapStep,
+			     keep_score, relation_keep, scaled_ok ? 1 : 0, scale[0],
+			     scale[1], scale[2], dark_pixels(source, source_width),
+			     best_any, known_any);
+		}
+		if (port_map_loss_dumps < 12) {
+			++port_map_loss_dumps;
+			std::filesystem::create_directories("sea2_portloss");
+			char name[64] = {};
+			std::snprintf(name, sizeof(name), "sea2_portloss/drop%05u.png",
+			              composite_count);
+			dump_port_window(source, source_width, name);
+		}
+	}
+
+	// The map may still be there, only shifted or recoloured; such a frame is
+	// logged and kept, because it is the one that shows for a moment before the
+	// artwork comes back. A screen that is still black is skipped: that is the
+	// game painting, not the map.
+	if (port_map_miss_logs < 40) {
+		++port_map_miss_logs;
+		diag("PORTMISSLOST frame=%u best=%d known=%d dark=%d", composite_count,
+		     best_any, known_any, dark_pixels(source, source_width));
+	}
+	if (port_map_miss_logs <= 4 && best_any >= 20) {
+		std::filesystem::create_directories("sea2_portloss");
+		char name[64] = {};
+		std::snprintf(name, sizeof(name), "sea2_portloss/miss%05u.png",
+		              composite_count);
+		dump_port_window(source, source_width, name);
+	}
+
+	// Something else is on screen. The first few misses are written out, because
+	// they say whether the window is simply another screen or whether the map is
+	// drawn with colours that no longer match.
+	if (port_map_diags < PortMapDiagCount && composite_count % 30 == 0) {
+		++port_map_diags;
+		std::unordered_map<uint32_t, int> colours = {};
+		for (int y = 0; y < PortMapWindowSize; y += 8) {
+			const auto* row = source +
+			                  static_cast<size_t>(PortMapWindowY + y) *
+			                          source_width +
+			                  PortMapWindowX;
+			for (int x = 0; x < PortMapWindowSize; x += 8) {
+				++colours[row[x] & 0x00ffffff];
+			}
+		}
+		diag("PORTMISS frame=%u keep=%d best=%d known=%d", composite_count,
+		     keep_score, best_any, known_any);
+		for (auto i = 0; i < 4 && !colours.empty(); ++i) {
+			auto top = colours.begin();
+			for (auto it = colours.begin(); it != colours.end(); ++it) {
+				if (it->second > top->second) {
+					top = it;
+				}
+			}
+			diag("PORTMISS colour %06x n=%d", static_cast<unsigned>(top->first),
+			     top->second);
+			colours.erase(top);
+		}
+	}
+	port_map_retry = PortMapRetryFrames;
+}
+
+// The artwork keeps the shape of every tile but not its brightness: the map is
+// dithered, the artwork is not, and where the game draws black outlines the
+// artwork averages a pale blue. Drawing the artwork as it is would lighten the
+// whole port, in every time of day. The average colour of the artwork inside
+// each flat colour of the map is therefore measured once and subtracted again,
+// so the port keeps the brightness the game's palette gave it while the artwork
+// only adds its detail.
+void ensure_port_art_means(const PortMap& map,
+                           const std::vector<uint32_t>& artwork)
+{
+	if (map.art_means_ready) {
+		return;
+	}
+	const auto art_stride = PortMapSize * HdScale;
+	std::unordered_map<uint32_t, std::array<double, 4>> sums = {};
+	for (int y = 0; y < PortMapSize; y += 2) {
+		const auto* base_row = map.pixels.data() +
+		                       static_cast<size_t>(y) * PortMapSize;
+		for (int x = 0; x < PortMapSize; x += 2) {
+			const auto base = base_row[x] & 0x00ffffffu;
+			auto& sum       = sums[base];
+			sum[3] += 4.0;
+			for (int dy = 0; dy < HdScale; dy += 2) {
+				const auto* art_row = artwork.data() +
+				        static_cast<size_t>(y) * HdScale * art_stride +
+				        static_cast<size_t>(x) * HdScale +
+				        static_cast<size_t>(dy) * art_stride;
+				for (int dx = 0; dx < HdScale; dx += 2) {
+					const auto art = art_row[dx];
+					sum[0] += static_cast<double>((art >> 16) & 0xff);
+					sum[1] += static_cast<double>((art >> 8) & 0xff);
+					sum[2] += static_cast<double>(art & 0xff);
+				}
+			}
+		}
+	}
+	auto& table = map.art_means;
+	table.clear();
+	for (const auto& [colour, sum] : sums) {
+		if (sum[3] <= 0.0) {
+			continue;
+		}
+		table[colour] = {static_cast<float>(sum[0] / sum[3]),
+		                 static_cast<float>(sum[1] / sum[3]),
+		                 static_cast<float>(sum[2] / sum[3])};
+	}
+	map.art_means_ready = true;
+}
+
+// Draws the window through the palette that was read off the same frame. A pixel
+// is the map exactly when the palette turned its map colour into the colour the
+// frame shows there, so the character, an item, a dialog or the pointer can never
+// be painted over. The artwork keeps that colour and only adds its own detail on
+// top of it, so the port looks the way the game's palette made it look.
+void draw_port_map_measured(const PortMap& map,
+                            const std::vector<uint32_t>& artwork,
+                            const uint32_t* source, const int source_width,
+                            uint32_t* destination, const int destination_stride)
+{
+	const auto& pairs = port_map_palette_pairs;
+	// A map colour normally becomes exactly one screen colour. While the game
+	// fades its palette in entry by entry, two of its entries hold the very same
+	// map colour and then one of them is reached first: the same map pixel is
+	// shown in either of the two colours, so both are looked up and the one the
+	// frame really holds is used.
+	const auto screen_colours_of = [&pairs](const uint32_t colour) {
+		const auto first = std::lower_bound(
+		        pairs.begin(), pairs.end(),
+		        std::pair<uint32_t, uint32_t>{colour, 0u});
+		auto last = first;
+		while (last != pairs.end() && last->first == colour) {
+			++last;
+		}
+		return std::make_pair(first, last);
+	};
+	ensure_port_art_means(map, artwork);
+	const auto art_mean_of = [&map](const uint32_t colour) -> const float* {
+		const auto it = map.art_means.find(colour);
+		return it != map.art_means.end() ? it->second.data() : nullptr;
+	};
+
+	const auto art_stride = PortMapSize * HdScale;
+	const auto channel    = [](const int value) {
+		return static_cast<uint32_t>(std::clamp(value, 0, 255));
+	};
+
+	// Mark the pixels of a panel the game painted over the port. Only a pixel
+	// that sits in a long flat run across *and* down is paper: every one of the
+	// map's tiles is dithered, so the map never has such an area.
+	auto* panel = port_map_panel.data();
+	if (!port_map_panel_ready) {
+		port_panel_mask(source, source_width, panel);
+	}
+	for (int ty = 0; ty < PortMapCells; ++ty) {
+		for (int tx = 0; tx < PortMapCells; ++tx) {
+			const auto source_x = PortMapWindowX + tx * PortMapStep;
+			const auto source_y = PortMapWindowY + ty * PortMapStep;
+			const auto map_x    = port_map_offset_x + tx * PortMapStep;
+			const auto map_y    = port_map_offset_y + ty * PortMapStep;
+			for (int y = 0; y < PortMapStep; ++y) {
+				const auto* row = source +
+				                  static_cast<size_t>(source_y + y) * source_width +
+				                  source_x;
+				const auto* base_row = map.pixels.data() +
+				                       static_cast<size_t>(map_y + y) * PortMapSize +
+				                       map_x;
+				const auto* art_row = artwork.data() +
+				                      static_cast<size_t>(map_y + y) * HdScale *
+				                              art_stride +
+				                      static_cast<size_t>(map_x) * HdScale;
+				auto* out_row = destination +
+				                static_cast<size_t>(source_y + y) * HdScale *
+				                        destination_stride +
+				                static_cast<size_t>(source_x) * HdScale;
+				for (int x = 0; x < PortMapStep; ++x) {
+					const auto base          = base_row[x] & 0x00ffffffu;
+					const auto [first, last] = screen_colours_of(base);
+					auto hit                 = last;
+					for (auto it = first; it != last; ++it) {
+						if (it->second == (row[x] & 0x00ffffffu)) {
+							hit = it;
+							break;
+						}
+					}
+					if (hit == last) {
+						continue;
+					}
+					const auto wants = hit->second;
+					// A pixel of a panel over the port keeps the game's own
+					// pixels, even where the paper happens to be one of the
+					// map's colours.
+					if ((panel[static_cast<size_t>(ty * PortMapStep + y) *
+					                   PortMapWindowSize +
+					           tx * PortMapStep + x] &
+					     3) == 3) {
+						continue;
+					}
+					const auto base_r    = static_cast<int>((base >> 16) & 0xff);
+					const auto base_g    = static_cast<int>((base >> 8) & 0xff);
+					const auto base_b    = static_cast<int>(base & 0xff);
+					const auto screen_r  = static_cast<int>((wants >> 16) & 0xff);
+					const auto screen_g  = static_cast<int>((wants >> 8) & 0xff);
+					const auto screen_b  = static_cast<int>(wants & 0xff);
+					const auto* mean     = art_mean_of(base);
+					const auto mean_r    = mean ? static_cast<int>(mean[0] + 0.5f)
+					                            : base_r;
+					const auto mean_g    = mean ? static_cast<int>(mean[1] + 0.5f)
+					                            : base_g;
+					const auto mean_b    = mean ? static_cast<int>(mean[2] + 0.5f)
+					                            : base_b;
+					auto* block          = out_row + x * HdScale;
+					const auto* art_block = art_row + x * HdScale;
+					for (int dy = 0; dy < HdScale; ++dy) {
+						auto* line = block +
+						             static_cast<size_t>(dy) *
+						                     destination_stride;
+						const auto* art_line = art_block +
+						                       static_cast<size_t>(dy) * art_stride;
+						for (int dx = 0; dx < HdScale; ++dx) {
+							const auto art = art_line[dx];
+							const auto r   = channel(screen_r - mean_r +
+							                         static_cast<int>((art >> 16) & 0xff));
+							const auto g   = channel(screen_g - mean_g +
+							                         static_cast<int>((art >> 8) & 0xff));
+							const auto b   = channel(screen_b - mean_b +
+							                         static_cast<int>(art & 0xff));
+							line[dx] = (r << 16) | (g << 8) | b;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// Every cell the game did not take from the map is left exactly as the game
+// drew it, so the character keeps walking over the artwork instead of through
+// it. A cell that is mostly something else - a dialog, a label, the pointer -
+// is skipped as a whole, so no map pixel leaks into a panel that happens to use
+// one of its colours.
+void draw_port_map(const uint32_t* source, const int source_width,
+                   uint32_t* destination, const int destination_stride)
+{
+	port_map_drew_last = false;
+	// 0 = the game's own pixels, 1 = artwork through the stored palette, 2 = the
+	// artwork through the palette read off the frame. The port must never switch
+	// between these from one frame to the next while the character walks, so
+	// every switch is written out.
+	auto state = 0;
+	if (port_map_visible && port_map_selected >= 0) {
+		const auto& art = port_map_art.find(
+		        port_maps[static_cast<size_t>(port_map_selected)].index);
+		if (art != port_map_art.end() && !art->second.empty()) {
+			state = port_map_measured ? 2 : 1;
+		}
+	}
+	if (state != port_map_last_state && port_map_state_logs < 80) {
+		++port_map_state_logs;
+		diag("PORTSTATE %d->%d frame=%u x=%d y=%d sel=%d",
+		     port_map_last_state, state, composite_count, port_map_offset_x,
+		     port_map_offset_y, port_map_selected);
+	}
+	port_map_last_state = state;
+
+	if (!port_map_visible || port_map_selected < 0) {
+		return;
+	}
+	const auto& map = port_maps[static_cast<size_t>(port_map_selected)];
+	const auto found = port_map_art.find(map.index);
+	if (found == port_map_art.end() || found->second.empty()) {
+		return;
+	}
+	const auto& artwork = found->second;
+	port_map_drew_last = true;
+	if (port_map_measured && !port_map_palette_pairs.empty()) {
+		draw_port_map_measured(map, artwork, source, source_width, destination,
+		                       destination_stride);
+		return;
+	}
+	const auto faded    = port_map_fade[0] < 0.999f ||
+	                   port_map_fade[1] < 0.999f || port_map_fade[2] < 0.999f;
+	// The time of day and, while the game fades its screen, the fade as well.
+	const std::array<float, 3> shade = {map.gain[0] * port_map_fade[0],
+	                                    map.gain[1] * port_map_fade[1],
+	                                    map.gain[2] * port_map_fade[2]};
+	const auto tinted   = faded || shade[0] < 0.999f || shade[1] < 0.999f ||
+	                    shade[2] < 0.999f || shade[0] > 1.001f ||
+	                    shade[1] > 1.001f || shade[2] > 1.001f;
+	// The artwork was drawn for one time of day; the other three scale it the way
+	// the game scales its own palette, so the port keeps its morning, evening and
+	// night look instead of staying as bright as noon.
+	const auto tint = [&shade](const uint32_t colour) {
+		const auto r = std::min(255, static_cast<int>(((colour >> 16) & 0xff) *
+		                                              shade[0]));
+		const auto g = std::min(255, static_cast<int>(((colour >> 8) & 0xff) *
+		                                              shade[1]));
+		const auto b = std::min(255, static_cast<int>((colour & 0xff) * shade[2]));
+		return static_cast<uint32_t>((r << 16) | (g << 8) | b);
+	};
+	const auto same_colour = [&shade, faded](const uint32_t actual,
+	                                         const uint32_t expected) {
+		if (!faded) {
+			return port_colour(actual) == port_colour(expected);
+		}
+		const auto dr = static_cast<int>((actual >> 16) & 0xff) -
+		                std::min(255,
+		                         static_cast<int>(((expected >> 16) & 0xff) *
+		                                          shade[0]));
+		const auto dg = static_cast<int>((actual >> 8) & 0xff) -
+		                std::min(255,
+		                         static_cast<int>(((expected >> 8) & 0xff) *
+		                                          shade[1]));
+		const auto db = static_cast<int>(actual & 0xff) -
+		                std::min(255,
+		                         static_cast<int>((expected & 0xff) * shade[2]));
+		return dr >= -14 && dr <= 14 && dg >= -14 && dg <= 14 && db >= -14 &&
+		       db <= 14;
+	};
+
+	const auto art_stride = PortMapSize * HdScale;
+	// Reconnaissance: which cells were replaced this frame and which were left
+	// alone, so a region that stays low resolution can be looked at directly.
+	const auto trace_cells = port_map_diags < PortMapDiagCount &&
+	                         composite_count % 30 == 0;
+	char states[PortMapCellCount + 1] = {};
+	for (int ty = 0; ty < PortMapCells; ++ty) {
+		for (int tx = 0; tx < PortMapCells; ++tx) {
+			const auto source_x = PortMapWindowX + tx * PortMapStep;
+			const auto source_y = PortMapWindowY + ty * PortMapStep;
+			const auto map_x    = port_map_offset_x + tx * PortMapStep;
+			const auto map_y    = port_map_offset_y + ty * PortMapStep;
+
+			int same = 0;
+			for (int y = 0; y < PortMapStep; ++y) {
+				const auto* row = source +
+				                  static_cast<size_t>(source_y + y) * source_width +
+				                  source_x;
+				const auto* expected = map.pixels.data() +
+				                       static_cast<size_t>(map_y + y) * PortMapSize +
+				                       map_x;
+				for (int x = 0; x < PortMapStep; ++x) {
+					same += same_colour(row[x], expected[x]) ? 1 : 0;
+				}
+			}
+			const auto whole = same == PortMapStep * PortMapStep;
+			if (!whole && same < PortMapPartialCell) {
+				if (trace_cells) {
+					states[ty * PortMapCells + tx] = 'x';
+				}
+				continue;
+			}
+			if (trace_cells) {
+				states[ty * PortMapCells + tx] = whole ? 'W' : 'p';
+			}
+
+			for (int y = 0; y < PortMapStep; ++y) {
+				const auto* row = source +
+				                  static_cast<size_t>(source_y + y) * source_width +
+				                  source_x;
+				const auto* expected = map.pixels.data() +
+				                       static_cast<size_t>(map_y + y) * PortMapSize +
+				                       map_x;
+				const auto* art = artwork.data() +
+				                  static_cast<size_t>(map_y + y) * HdScale *
+				                          art_stride +
+				                  map_x * HdScale;
+				auto* out = destination +
+				            static_cast<size_t>(source_y + y) * HdScale *
+				                    destination_stride +
+				            static_cast<size_t>(source_x) * HdScale;
+				for (int x = 0; x < PortMapStep; ++x) {
+					if (!whole && !same_colour(row[x], expected[x])) {
+						continue;
+					}
+					auto* block = out + x * HdScale;
+					const auto* art_block = art + x * HdScale;
+					for (int dy = 0; dy < HdScale; ++dy) {
+						auto* line = block +
+						             static_cast<size_t>(dy) *
+						                     destination_stride;
+						const auto* art_line = art_block +
+						                       static_cast<size_t>(dy) * art_stride;
+						if (!tinted) {
+							std::memcpy(line, art_line,
+							            HdScale * sizeof(uint32_t));
+							continue;
+						}
+						for (int dx = 0; dx < HdScale; ++dx) {
+							line[dx] = tint(art_line[dx]);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if (trace_cells) {
+		auto skipped = 0;
+		for (const auto state : states) {
+			skipped += state == 'x' ? 1 : 0;
+		}
+		if (skipped >= 4) {
+			diag_port_cells(source, source_width, destination,
+			                destination_stride, states);
+		}
+	}
+}
+
+std::array<float, 3> port_mean_colour(const std::vector<uint32_t>& pixels)
+{
+	double sum[3] = {0.0, 0.0, 0.0};
+	for (const auto colour : pixels) {
+		sum[0] += static_cast<double>((colour >> 16) & 0xff);
+		sum[1] += static_cast<double>((colour >> 8) & 0xff);
+		sum[2] += static_cast<double>(colour & 0xff);
+	}
+	const auto scale = pixels.empty()
+	                         ? 0.0
+	                         : 1.0 / static_cast<double>(pixels.size());
+	return {static_cast<float>(sum[0] * scale),
+	        static_cast<float>(sum[1] * scale),
+	        static_cast<float>(sum[2] * scale)};
+}
+
+int port_map_index_of(const std::string& name)
+{
+	if (name.size() < 4) {
+		return -1;
+	}
+	int index = 0;
+	for (auto i = 0; i < 3; ++i) {
+		const auto digit = name[static_cast<size_t>(i)];
+		if (digit < '0' || digit > '9') {
+			return -1;
+		}
+		index = index * 10 + (digit - '0');
+	}
+	return index;
+}
+
+// Loads one palette of a port map. The map exists once per time of day, because
+// the game recolours the whole port as the day passes; the palette the artwork
+// was drawn for is the reference that the others are scaled against.
+bool load_port_map(const uint32_t index, const std::string& filename,
+                   const bool reference)
+{
+	const auto path = (assets_root / "PORTMAP" / filename).string();
+
+	auto* loaded = IMG_Load(path.c_str());
+	if (!loaded) {
+		LOG_WARNING("SEA2HD: Cannot load port map %s: %s", filename.c_str(),
+		            IMG_GetError());
+		return false;
+	}
+	auto* converted = SDL_ConvertSurfaceFormat(loaded, SDL_PIXELFORMAT_RGBA32, 0);
+	SDL_FreeSurface(loaded);
+	if (!converted) {
+		return false;
+	}
+	if (converted->w != PortMapSize || converted->h != PortMapSize) {
+		LOG_WARNING("SEA2HD: Port map %s has invalid dimensions %dx%d",
+		            filename.c_str(), converted->w, converted->h);
+		SDL_FreeSurface(converted);
+		return false;
+	}
+
+	PortMap map = {};
+	map.index   = index;
+	map.pixels.resize(static_cast<size_t>(PortMapSize) * PortMapSize);
+
+	if (SDL_LockSurface(converted) != 0) {
+		SDL_FreeSurface(converted);
+		return false;
+	}
+	for (int y = 0; y < PortMapSize; ++y) {
+		const auto* row = static_cast<const uint8_t*>(converted->pixels) +
+		                  static_cast<size_t>(y) * converted->pitch;
+		auto* out = map.pixels.data() + static_cast<size_t>(y) * PortMapSize;
+		for (int x = 0; x < PortMapSize; ++x) {
+			out[x] = (static_cast<uint32_t>(row[x * 4 + 0]) << 16) |
+			         (static_cast<uint32_t>(row[x * 4 + 1]) << 8) |
+			         static_cast<uint32_t>(row[x * 4 + 2]);
+		}
+	}
+	SDL_UnlockSurface(converted);
+	SDL_FreeSurface(converted);
+
+	// The grid is what every frame is matched against, so the hashes are built
+	// once here instead of on every frame.
+	for (int cell_y = 0; cell_y < PortMapGridSize; ++cell_y) {
+		for (int cell_x = 0; cell_x < PortMapGridSize; ++cell_x) {
+			const auto* cell_pixels =
+			        map.pixels.data() +
+			        static_cast<size_t>(cell_y * PortMapStep) * PortMapSize +
+			        cell_x * PortMapStep;
+			const auto hash =
+			        hash_port_cell(cell_pixels, PortMapSize);
+			const auto cell = static_cast<uint16_t>(
+			        cell_y * PortMapGridSize + cell_x);
+			map.cells[cell] = hash;
+			map.cell_index[hash].push_back(cell);
+
+			std::array<uint64_t, PortMapRelationWords> relations = {};
+			port_cell_relations(cell_pixels, PortMapSize, relations);
+			const auto relation_hash = hash_port_relations(relations);
+			map.relation_hashes[cell] = relation_hash;
+			map.relation_index[relation_hash].push_back(cell);
+		}
+	}
+
+	const auto mean = port_mean_colour(map.pixels);
+	if (reference || port_map_palette.find(index) == port_map_palette.end()) {
+		port_map_palette[index] = mean;
+	} else {
+		const auto& base = port_map_palette[index];
+		for (auto i = 0; i < 3; ++i) {
+			const auto channel = static_cast<size_t>(i);
+			const auto ratio   = base[channel] > 1.0f
+			                             ? mean[channel] / base[channel]
+			                             : 1.0f;
+			map.gain[channel]  = std::clamp(ratio, 0.30f, 1.60f);
+		}
+	}
+
+	port_maps.push_back(std::move(map));
+	return true;
+}
+
+// The artwork is one image for the whole port, whatever the time of day.
+bool load_port_map_art(const uint32_t index)
+{
+	if (port_map_art.find(index) != port_map_art.end()) {
+		return true;
+	}
+
+	char name[16] = {};
+	std::snprintf(name, sizeof(name), "%03u_hd.png", index);
+	const auto path = (assets_root / "PORTMAP" / name).string();
+
+	auto* loaded = IMG_Load(path.c_str());
+	if (!loaded) {
+		return false;
+	}
+	auto* art = SDL_ConvertSurfaceFormat(loaded, SDL_PIXELFORMAT_RGBA32, 0);
+	SDL_FreeSurface(loaded);
+	const auto art_size = PortMapSize * HdScale;
+	if (!art || art->w != art_size || art->h != art_size ||
+	    SDL_LockSurface(art) != 0) {
+		if (art) {
+			SDL_FreeSurface(art);
+		}
+		LOG_WARNING("SEA2HD: Port map %u artwork is missing or unusable", index);
+		return false;
+	}
+
+	auto& pixels = port_map_art[index];
+	pixels.resize(static_cast<size_t>(art_size) * art_size);
+	for (int y = 0; y < art_size; ++y) {
+		const auto* row = static_cast<const uint8_t*>(art->pixels) +
+		                  static_cast<size_t>(y) * art->pitch;
+		auto* out = pixels.data() + static_cast<size_t>(y) * art_size;
+		for (int x = 0; x < art_size; ++x) {
+			out[x] = (static_cast<uint32_t>(row[x * 4 + 0]) << 16) |
+			         (static_cast<uint32_t>(row[x * 4 + 1]) << 8) |
+			         static_cast<uint32_t>(row[x * 4 + 2]);
+		}
+	}
+	SDL_UnlockSurface(art);
+	SDL_FreeSurface(art);
+	LOG_MSG("SEA2HD: Loaded port map %u artwork", index);
+	return true;
+}
+
+// Every file in the folder is one palette of one map: `002.png` is the palette
+// the artwork was drawn for, `002_night.png` another time of day of the same map
+// and `002_hd.png` the artwork itself.
+void preload_port_maps()
+{
+	if (port_maps_loaded) {
+		return;
+	}
+	port_maps_loaded = true;
+
+	const auto dir = assets_root / "PORTMAP";
+	std::error_code error;
+	const auto started = SDL_GetTicks64();
+
+	std::vector<std::string> names = {};
+	for (const auto& file : std::filesystem::directory_iterator(dir, error)) {
+		names.push_back(file.path().filename().string());
+	}
+	if (error) {
+		return;
+	}
+
+	const auto is_png = [](const std::string& name) {
+		return name.size() > 4 && name.compare(name.size() - 4, 4, ".png") == 0;
+	};
+
+	// The reference palettes first, so the others can be scaled against them.
+	for (const auto& name : names) {
+		if (name.size() != 7 || !is_png(name)) {
+			continue;
+		}
+		const auto index = port_map_index_of(name);
+		if (index >= 0) {
+			load_port_map(static_cast<uint32_t>(index), name, true);
+		}
+	}
+	for (const auto& name : names) {
+		if (name.size() <= 7 || name[3] != '_' || !is_png(name) ||
+		    name.compare(4, 2, "hd") == 0) {
+			continue;
+		}
+		const auto index = port_map_index_of(name);
+		if (index >= 0) {
+			load_port_map(static_cast<uint32_t>(index), name, false);
+		}
+	}
+	for (const auto& name : names) {
+		if (name.size() <= 7 || name[3] != '_' || !is_png(name) ||
+		    name.compare(4, 2, "hd") != 0) {
+			continue;
+		}
+		const auto index = port_map_index_of(name);
+		if (index >= 0) {
+			load_port_map_art(static_cast<uint32_t>(index));
+		}
+	}
+
+	LOG_MSG("SEA2HD: Preloaded %zu port map palettes in %llu ms",
+	        port_maps.size(),
+	        static_cast<unsigned long long>(SDL_GetTicks64() - started));
 }
 
 void SEA2_HD_ClearProgram()
@@ -3990,6 +5946,7 @@ void SEA2_HD_NotifyProgramExecuted(const uint16_t pspseg, const uint16_t loadseg
 	SEA2_HD_VerifyGlyphMap();
 	if (hd_enabled) {
 		preload_kao64_assets();
+		preload_port_maps();
 	}
 }
 
@@ -4068,6 +6025,12 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 		for (int dy = 1; dy < HdScale; ++dy) {
 			std::memcpy(out + dy * destination_stride, out, row_bytes);
 		}
+	}
+
+	if (source_width == VgaWidth && source_height == VgaHeight) {
+		update_port_map(source, source_width);
+		draw_port_map(source, source_width, destination,
+		              destination_stride);
 	}
 
 	// One brightness sample per cell of a coarse grid, compared with the frame a

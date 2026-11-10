@@ -55,4 +55,10 @@ void SEA2_HD_TraceKaoEntry(uint16_t ip);
 void SEA2_HD_Composite(const uint32_t* source, int source_width, int source_height,
                        uint32_t* destination, int destination_pitch);
 
+// Reconnaissance switch: while tracing, save the 640x480 frame buffer as a PNG
+// every N frames (0 turns it off) so a screen can be looked at next to the
+// trace log.
+void SEA2_HD_SetFrameDump(int interval);
+void SEA2_HD_DumpFrame(const void* pixels, int pitch, int width, int height);
+
 #endif

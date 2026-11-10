@@ -252,8 +252,10 @@ bool RENDER_StartUpdate()
 	scaler_changed_lines[0]   = 0;
 	scaler_changed_line_index = 0;
 
+	// Also advanced while only tracing, so the trace can be split into frames.
+	SEA2_HD_AdvanceFrame();
+
 	if (sea2_hd_output_active) {
-		SEA2_HD_AdvanceFrame();
 		render.scale.out_width  = render.src.width * Sea2HdScale;
 		render.scale.out_height = render.src.height * Sea2HdScale;
 
@@ -422,6 +424,16 @@ void RENDER_EndUpdate([[maybe_unused]] bool abort)
 	} else if (is_deinterlacing() && render.updating_frame) {
 		// Only deinterlace the regular output if the frame has changed.
 		deinterlace_rendered_output();
+	}
+
+	// The cache holds the whole source frame in the very pixel format the
+	// composite path receives, so it can be saved as is for inspection.
+	if (!abort && render.src.pixel_format == PixelFormat::BGRX32_ByteArray &&
+	    render.scale.cache_pitch > 0) {
+		SEA2_HD_DumpFrame(render.scale.cache.data(),
+		                  render.scale.cache_pitch,
+		                  static_cast<int>(render.src.width),
+		                  static_cast<int>(render.src.height));
 	}
 
 	GFX_EndUpdate();
@@ -1664,6 +1676,13 @@ static void init_render_settings(SectionProp& section)
 	string_prop = section.AddString("sea2_hd_path", Always, "../assets/hd");
 	string_prop->SetHelp("Directory containing the Uncharted Waters 2 HD assets.");
 
+	int_prop = section.AddInt("sea2_hd_frame_dump", Always, 0);
+	int_prop->SetHelp(
+	        "Save the 640x480 frame buffer as a PNG every N frames while tracing ('0'\n"
+	        "disables the dump). The files are written to 'sea2_frames' in the current\n"
+	        "directory, which makes it possible to see which moment of a trace shows a\n"
+	        "given screen.");
+
 	string_prop = section.AddString("shader", Always, "crt-auto");
 	string_prop->SetOptionHelp(
 	        "Set an adaptive CRT monitor emulation shader or a regular shader ('crt-auto' by\n"
@@ -2856,6 +2875,7 @@ void RENDER_Init()
 
 	SEA2_HD_SetMode(section->GetStringLowCase("sea2_hd"),
 	                section->GetString("sea2_hd_path"));
+	SEA2_HD_SetFrameDump(section->GetInt("sea2_hd_frame_dump"));
 
 	set_aspect_ratio_correction(*section);
 	set_viewport(*section);
@@ -2897,6 +2917,9 @@ static void notify_render_setting_updated(SectionProp& section,
 	if (prop_name == "sea2_hd" || prop_name == "sea2_hd_path") {
 		SEA2_HD_SetMode(section.GetStringLowCase("sea2_hd"),
 		                section.GetString("sea2_hd_path"));
+
+	} else if (prop_name == "sea2_hd_frame_dump") {
+		SEA2_HD_SetFrameDump(section.GetInt("sea2_hd_frame_dump"));
 
 	} else if (prop_name == "aspect") {
 		set_aspect_ratio_correction(section);
