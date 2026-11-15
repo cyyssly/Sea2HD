@@ -23,9 +23,10 @@ void SEA2_HD_TraceStringOp(uint16_t cs, uint16_t ip, uint16_t ds, uint16_t si,
 void SEA2_HD_TraceBlit(uint16_t ds, uint16_t src, uint16_t x, uint16_t y,
                        uint16_t width, uint16_t height, uint16_t planes);
 void SEA2_HD_ScanFont();
-void SEA2_HD_TraceDosOpen(const char* name, uint16_t handle);
+void SEA2_HD_TraceDosOpen(const char* name, uint16_t handle, uint16_t cs,
+                          uint16_t ip, uint16_t name_ds, uint16_t name_dx);
 void SEA2_HD_TraceDosRead(uint16_t ds, uint16_t dx, uint16_t len, uint16_t handle,
-                          uint32_t file_offset);
+                          uint32_t file_offset, uint16_t cs, uint16_t ip);
 void SEA2_HD_TraceInt21Ring(uint16_t ss, uint16_t sp, const uint32_t* history,
                             unsigned count);
 void SEA2_HD_TraceBlitterEntry(uint16_t ip);

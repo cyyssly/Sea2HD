@@ -1038,7 +1038,7 @@ static Bitu DOS_21Handler(void) {
 	case 0x3d:		/* OPEN Open existing file */
 		MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
 		if (DOS_OpenFile(name1, reg_al, &reg_ax)) {
-			SEA2_HD_TraceDosOpen(name1, reg_ax);
+			SEA2_HD_TraceDosOpen(name1, reg_ax, SegValue(cs), reg_ip, ds, reg_dx);
 			DOS_PerformDiskIoDelayByHandle(EstimatedFileOpenIoOverheadInBytes,
 			                               reg_bx);
 			CALLBACK_SCF(false);
@@ -1072,7 +1072,7 @@ static Bitu DOS_21Handler(void) {
 			        // Called after the transfer so the hook can inspect the glyph
 			        // bitmap that just landed in DOS memory.
 			        SEA2_HD_TraceDosRead(SegValue(ds), reg_dx, toread, reg_bx,
-			                             sea2_read_start);
+			                             sea2_read_start, SegValue(cs), reg_ip);
 				reg_ax=toread;
 				CALLBACK_SCF(false);
 			} else {
