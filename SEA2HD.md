@@ -377,12 +377,6 @@ assets/
 
 - `sea2-hd-diag.log`：`sea2-hd.conf` 同目录，记录 `ADD` / `SCENE LOCK` / `HIDE pointer…` /
   每框 `covered`、`diff` 等事件，用于确认识别与替换是否干净。
-- 数字/面板相关事件：`PANELSCAN`（换场景后每扫一次面板、认出几格）、`PANELHIT`（扫描登记了
-  哪一格及其笔画色/纸色）、`PANELBLIT`（游戏自己 blit 的面板细条）、`ASCIIDRAW`（右面板每
-  60 帧的绘制量）、`ASCIINOPE`（这一格因为"自己的墨色/纸色看不见"被挡下）、
-  `ASCIIFAIL`（认不出来的原因与计数）、`ASCIITRUST`（整屏换掉、记忆色作废）。
-- `sea2-box-*.png`：调试构建会把每个被跟踪的方框导出为 `src` / `ref` / `mask` 三张图
-  （这些文件不入库）。
 - 港口地图相关事件：`PORTMAP`（地图就绪）、`PORTSTATE`（可见状态切换）、`PORTREL` / `PORTRELMAP`
   （关系哈希命中的偏移与实测色对）、`PORTPANEL`（消息框遮挡）、`PORTFADE`（渐变保位）、
   `PORTDROP`（本帧交回游戏）、`PORTMISS`（搜索失败时的窗口主色）。

@@ -714,15 +714,6 @@ void record_cover_rect(const uint16_t x, const uint16_t y,
 		}
 		cover_rects[oldest] = rect;
 	}
-	// 临时诊断：确认游戏到底有没有为对话框这类整块美术登记过矩形。
-	{
-		static int cover_logged = 0;
-		if (cover_logged < 240) {
-			diag("COVERRECT px=%d py=%d w=%d h=%d order=%u", px, py,
-			     rect.width, rect.height, rect.order);
-			++cover_logged;
-		}
-	}
 }
 
 // 每帧合成时调用一次：还没采签名的矩形补采，已有的核对，整块已经不在屏幕上
@@ -1061,15 +1052,9 @@ std::vector<std::pair<uint32_t, uint32_t>> port_map_palette_pairs = {};
 std::FILE* diag_file = nullptr;
 int diag_lines       = 0;
 uint32_t composite_count = 0;
-// 临时探针：距离上一次整屏黑过了多少帧，以及本场景里各条链路是否已经记过一次。
+// 距离上一次整屏黑过了多少帧。面板扫描与"这一格是不是刚 blit 上来"共用。
 uint32_t frames_since_black = 0;
-bool scene_probe_ascii_left  = false;
-bool scene_probe_ascii_right = false;
-bool scene_probe_kao         = false;
-bool scene_probe_fade        = false;
-bool scene_probe_pix         = false;
-// 本场景里已经认出来的面板格子给出的笔画色/纸色。画面若停在"底色已铺、数字
-// 还没落笔"的中间态，就用这一对颜色把游戏刚 blit 过来的字形画上。
+// 本场景里已经认出来的面板格子给出的笔画色/纸色。
 uint32_t ascii_panel_ink = 0;
 uint32_t ascii_panel_bg  = 0;
 bool ascii_panel_valid   = false;
@@ -1077,15 +1062,6 @@ bool ascii_panel_valid   = false;
 bool panel_scan_pending = false;
 uint64_t panel_scan_hash = 0;
 int panel_scan_count     = 0;
-int panel_scan_log_budget = 200;
-// 临时诊断：这一帧里有多个数字格被盖住时，同时导出原始画面和合成结果，
-// 用来直接比对残影是游戏自己的像素，还是我们画上去的。
-bool snapshot_wanted = false;
-int diag_dump_count      = 0;
-int diag_hd_dump_count   = 0;
-int diag_box_dump_count  = 0;
-int diag_out_dumps       = 0;
-int diag_raw_dumps       = 0;
 
 void diag(const char* format, ...)
 {
@@ -1196,9 +1172,7 @@ constexpr size_t BlitShapeTableSize = 4096;
 std::array<BlitShape, BlitShapeTableSize> blit_shape_table = {};
 uint16_t sea2_font_handle = 0xffff;
 
-// 临时诊断：最近一次被打开的文件名，用来把 blit 日志和资源文件对应起来。
-char sea2_last_dos_name[20] = {};
-// 临时诊断：句柄 -> 文件名，用来在读取时判断是哪个资源文件、读了哪个偏移。
+// 句柄 -> 文件名，用来在读取时判断是哪个资源文件、读了哪个偏移。
 std::unordered_map<uint16_t, std::string> sea2_dos_names = {};
 
 // Code addresses executed right after a 28-byte font glyph read.
@@ -1942,11 +1916,6 @@ int mark_foreign_pixels(
 	if (panel_on_intact_picture) {
 		command.overlay_like = true;
 	}
-	if (composite_count % 60 == 0 && free_pairs > 0) {
-		diag("PANELTST entry=%u x=%u y=%u frame=%u foreign=%d free=%d intact=%d panel=%d",
-		     command.entry, command.x, command.y, composite_count, foreign,
-		     free_pairs, intact_pairs, panel_on_intact_picture ? 1 : 0);
-	}
 
 	// Remembered so a fade can be applied to the high resolution artwork as
 	// well, instead of leaving it lit while the rest of the screen dims.
@@ -2282,224 +2251,6 @@ int mark_changed_pixels(const uint32_t* region, const int stride,
 	}
 	command.overlay_like = covered * 2 > Kao64Width * Kao64Height;
 	return covered;
-}
-
-// Temporary: write the current frame buffer with the tested box outlined, so
-// the actual contents of a rejected box can be inspected after a test run.
-void diag_dump_source(const uint32_t* source, const int width, const int height,
-                      const char* tag, const DrawCommand& command)
-{
-	if (diag_dump_count >= 40) {
-		return;
-	}
-	++diag_dump_count;
-
-	char name[96] = {};
-	std::snprintf(name,
-	              sizeof(name),
-	              "sea2-diag-%02d-%s-e%03u-%u-%u.png",
-	              diag_dump_count,
-	              tag,
-	              command.entry,
-	              command.x,
-	              command.y);
-
-	auto* surface = SDL_CreateRGBSurfaceWithFormat(0,
-	                                              width,
-	                                              height,
-	                                              32,
-	                                              SDL_PIXELFORMAT_RGBA32);
-	if (!surface) {
-		return;
-	}
-	if (SDL_LockSurface(surface) != 0) {
-		SDL_FreeSurface(surface);
-		return;
-	}
-
-	for (int y = 0; y < height; ++y) {
-		auto* row = static_cast<uint8_t*>(surface->pixels) +
-		            static_cast<size_t>(y) * surface->pitch;
-		const auto* in = source + static_cast<size_t>(y) * width;
-		for (int x = 0; x < width; ++x) {
-			const auto value   = in[x];
-			row[x * 4 + 0]     = static_cast<uint8_t>((value >> 16) & 0xff);
-			row[x * 4 + 1]     = static_cast<uint8_t>((value >> 8) & 0xff);
-			row[x * 4 + 2]     = static_cast<uint8_t>(value & 0xff);
-			row[x * 4 + 3]     = 0xff;
-		}
-	}
-
-	const int box_x = command.x;
-	const int box_y = command.y + ContentYOffset;
-	for (int dy = 0; dy < Kao64Height; ++dy) {
-		for (int dx = 0; dx < Kao64Width; ++dx) {
-			if (dx > 1 && dx < Kao64Width - 2 && dy > 1 &&
-			    dy < Kao64Height - 2) {
-				continue;
-			}
-			const int px = box_x + dx;
-			const int py = box_y + dy;
-			if (px < 0 || py < 0 || px >= width || py >= height) {
-				continue;
-			}
-			auto* pixel = static_cast<uint8_t*>(surface->pixels) +
-			              static_cast<size_t>(py) * surface->pitch + px * 4;
-			pixel[0] = 255;
-			pixel[1] = 0;
-			pixel[2] = 0;
-			pixel[3] = 255;
-		}
-	}
-
-	SDL_UnlockSurface(surface);
-	IMG_SavePNG(surface, name);
-	SDL_FreeSurface(surface);
-}
-
-// Temporary: write one box four times enlarged - as the game drew it, as it was
-// stored when the portrait was frozen, and with the pixels that the mask hands
-// back to the game painted red - so a box that is still painted over can be
-// compared by hand.
-void diag_dump_box(const uint32_t* pixels, const int stride, const uint8_t* mask,
-                   const char* tag, const DrawCommand& command)
-{
-	if (diag_box_dump_count >= 24) {
-		return;
-	}
-	++diag_box_dump_count;
-
-	constexpr int Scale = 4;
-	const int width     = Kao64Width * Scale;
-	const int height    = Kao64Height * Scale;
-
-	char name[96] = {};
-	std::snprintf(name,
-	              sizeof(name),
-	              "sea2-box-%02d-%s-e%03u-%u-%u.png",
-	              diag_box_dump_count,
-	              tag,
-	              command.entry,
-	              command.x,
-	              command.y);
-
-	auto* surface = SDL_CreateRGBSurfaceWithFormat(0,
-	                                              width,
-	                                              height,
-	                                              32,
-	                                              SDL_PIXELFORMAT_RGBA32);
-	if (!surface) {
-		return;
-	}
-	if (SDL_LockSurface(surface) != 0) {
-		SDL_FreeSurface(surface);
-		return;
-	}
-
-	for (int y = 0; y < height; ++y) {
-		auto* row      = static_cast<uint8_t*>(surface->pixels) +
-		            static_cast<size_t>(y) * surface->pitch;
-		const auto* in = pixels + static_cast<size_t>(y / Scale) * stride;
-		const auto* mk = mask ? mask + static_cast<size_t>(y / Scale) * Kao64Width
-		                      : nullptr;
-		for (int x = 0; x < width; ++x) {
-			const auto value = in[x / Scale];
-			auto r = static_cast<uint8_t>((value >> 16) & 0xff);
-			auto g = static_cast<uint8_t>((value >> 8) & 0xff);
-			auto b = static_cast<uint8_t>(value & 0xff);
-			if (mk && mk[x / Scale] != 0) {
-				r = 255;
-				g = 0;
-				b = 0;
-			}
-			row[x * 4 + 0] = r;
-			row[x * 4 + 1] = g;
-			row[x * 4 + 2] = b;
-			row[x * 4 + 3] = 0xff;
-		}
-	}
-
-	SDL_UnlockSurface(surface);
-	IMG_SavePNG(surface, name);
-	SDL_FreeSurface(surface);
-}
-
-// Writes the finished picture around one box with the blocks that were handed
-// back to the game tinted green, so the torn spots can be compared with the mask
-// that was supposed to protect them.
-void diag_dump_composite(const uint32_t* destination, const int stride,
-                         const DrawCommand& command)
-{
-	if (diag_hd_dump_count >= 60) {
-		return;
-	}
-	++diag_hd_dump_count;
-
-	constexpr int Margin = 16;
-	const int box_left   = command.x * HdScale;
-	const int box_top    = (command.y + ContentYOffset) * HdScale;
-	const int left       = std::max(0, box_left - Margin * HdScale);
-	const int top        = std::max(0, box_top - Margin * HdScale);
-	const int width = std::min(VgaWidth * HdScale - left,
-	                           (Kao64Width + 2 * Margin) * HdScale);
-	const int height = std::min(VgaHeight * HdScale - top,
-	                            (Kao64Height + 2 * Margin) * HdScale);
-	if (width <= 0 || height <= 0) {
-		return;
-	}
-
-	char name[96] = {};
-	std::snprintf(name,
-	              sizeof(name),
-	              "sea2-hd-%02d-e%03u-%u-%u.png",
-	              diag_hd_dump_count,
-	              command.entry,
-	              command.x,
-	              command.y);
-
-	auto* surface = SDL_CreateRGBSurfaceWithFormat(0,
-	                                              width,
-	                                              height,
-	                                              32,
-	                                              SDL_PIXELFORMAT_RGBA32);
-	if (!surface) {
-		return;
-	}
-	if (SDL_LockSurface(surface) != 0) {
-		SDL_FreeSurface(surface);
-		return;
-	}
-
-	for (int y = 0; y < height; ++y) {
-		auto* out = static_cast<uint8_t*>(surface->pixels) +
-		            static_cast<size_t>(y) * surface->pitch;
-		const auto* in = destination +
-		                 static_cast<size_t>(top + y) * stride + left;
-		const int src_y = (top + y) / HdScale - (command.y + ContentYOffset);
-		for (int x = 0; x < width; ++x) {
-			const auto value = in[x];
-			int r = static_cast<int>((value >> 16) & 0xff);
-			int g = static_cast<int>((value >> 8) & 0xff);
-			int b = static_cast<int>(value & 0xff);
-			const int src_x = (left + x) / HdScale - command.x;
-			if (src_x >= 0 && src_x < Kao64Width && src_y >= 0 &&
-			    src_y < Kao64Height &&
-			    command.covered[static_cast<size_t>(src_y) * Kao64Width +
-			                    static_cast<size_t>(src_x)] != 0) {
-				r = r * 3 / 5;
-				g = g * 3 / 5 + 100;
-				b = b * 3 / 5;
-			}
-			out[x * 4 + 0] = static_cast<uint8_t>(r);
-			out[x * 4 + 1] = static_cast<uint8_t>(g);
-			out[x * 4 + 2] = static_cast<uint8_t>(b);
-			out[x * 4 + 3] = 0xff;
-		}
-	}
-
-	SDL_UnlockSurface(surface);
-	IMG_SavePNG(surface, name);
-	SDL_FreeSurface(surface);
 }
 
 // Same rule as the text cells: nothing about the portrait is decided once and
@@ -3151,20 +2902,8 @@ void register_ascii_cell(const uint16_t x, const uint16_t y, const uint8_t digit
 	cell.order     = blit_order;
 	cell.fresh     = 3;
 	ascii_cells.push_back(cell);
-	static uint32_t ascii_registered = 0;
-	if (ascii_registered < 4000) {
-		diag("ASCIICELL since=%u f=%u x=%u y=%u digit=%u", frames_since_black,
-		     composite_count, x, y, digit);
-		++ascii_registered;
-	}
 	frame_dirty = true;
 }
-
-// Temporary diagnostics: a registered cell that cannot be identified is written
-// to the log once per distinct appearance, but only while the pointer sits on
-// it, so the highlight the game paints over hovered text can be read back.
-uint32_t diag_text_lines = 0;
-std::unordered_map<uint32_t, uint32_t> diag_text_signatures = {};
 
 bool pointer_over_text_cell(const uint16_t x, const uint16_t y,
                             const int Margin = 8)
@@ -3180,44 +2919,6 @@ bool pointer_over_text_cell(const uint16_t x, const uint16_t y,
 	       px < static_cast<int>(x) + TextGlyphWidth + Margin &&
 	       py >= static_cast<int>(y) + ContentYOffset - Margin &&
 	       py < static_cast<int>(y) + ContentYOffset + TextGlyphHeight + Margin;
-}
-
-void diag_text_failure(const uint16_t x, const uint16_t y, const int reason,
-                       const int used, const uint32_t* colors,
-                       const int* counts, const int* matched,
-                       const uint8_t* color_of)
-{
-	if (diag_text_lines >= 150) {
-		return;
-	}
-	if (!pointer_over_text_cell(x, y)) {
-		return;
-	}
-	uint32_t signature = 2166136261u ^ static_cast<uint32_t>(reason);
-	for (int i = 0; i < used; ++i) {
-		signature = (signature ^ colors[i]) * 16777619u;
-		signature = (signature ^ static_cast<uint32_t>(counts[i])) * 16777619u;
-	}
-	const uint32_t key = (static_cast<uint32_t>(x) << 16) | y;
-	const auto it = diag_text_signatures.find(key);
-	if (it != diag_text_signatures.end() && it->second == signature) {
-		return;
-	}
-	diag_text_signatures[key] = signature;
-
-	diag("TXTFAIL x=%u y=%u reason=%d used=%d", x, y, reason, used);
-	for (int i = 0; i < used; ++i) {
-		diag("  TXTCOLOR c=%d rgb=%06x count=%d match=%d",
-		     i, colors[i] & 0xffffffu, counts[i], matched[i]);
-	}
-	for (int row = 0; row < TextGlyphHeight; ++row) {
-		char line[TextGlyphWidth + 1] = {};
-		for (int col = 0; col < TextGlyphWidth; ++col) {
-			line[col] = static_cast<char>('0' + color_of[row * TextGlyphWidth + col]);
-		}
-		diag("  TXTROW %s", line);
-	}
-	diag_text_lines += 2 + used + TextGlyphHeight;
 }
 
 // Re-derives the glyph from the pixels currently on screen. Every distinct
@@ -3263,12 +2964,6 @@ bool identify_text_cell(const uint32_t* source, const int source_width,
 				// most a text cell can hold; anything richer is not a glyph
 				// cell.
 				if (used == MaxTextCellColors) {
-					int matched[MaxTextCellColors] = {};
-					for (int k = 0; k < used; ++k) {
-						matched[k] = -1;
-					}
-					diag_text_failure(x, y, 1, used, colors, counts, matched,
-					                  color_of);
 					if (fail_reason) {
 						*fail_reason = 1;
 						*fail_colors = used;
@@ -3284,12 +2979,7 @@ bool identify_text_cell(const uint32_t* source, const int source_width,
 		}
 	}
 
-	int matched[MaxTextCellColors] = {};
-	for (int i = 0; i < MaxTextCellColors; ++i) {
-		matched[i] = -1;
-	}
 	if (used < 2) {
-		diag_text_failure(x, y, 2, used, colors, counts, matched, color_of);
 		if (fail_reason) {
 			*fail_reason = 2;
 			*fail_colors = used;
@@ -3299,7 +2989,6 @@ bool identify_text_cell(const uint32_t* source, const int source_width,
 
 	int matches = 0;
 	for (int candidate = 0; candidate < used; ++candidate) {
-		matched[candidate] = 0;
 		if (counts[candidate] < MinGlyphInkPixels ||
 		    counts[candidate] > MaxGlyphInkPixels) {
 			continue;
@@ -3314,15 +3003,11 @@ bool identify_text_cell(const uint32_t* source, const int source_width,
 		if (it == glyph_index.end()) {
 			continue;
 		}
-		matched[candidate] = 1;
 		if (++matches > 1) {
-			matched[candidate] = 2;
-		if (fail_reason) {
-			*fail_reason = 4;
-			*fail_colors = used;
-		}
-			diag_text_failure(x, y, 4, used, colors, counts, matched,
-			                  color_of);
+			if (fail_reason) {
+				*fail_reason = 4;
+				*fail_colors = used;
+			}
 			return false;
 		}
 		record = it->second;
@@ -3339,7 +3024,6 @@ bool identify_text_cell(const uint32_t* source, const int source_width,
 		background = best >= 0 ? colors[best] : colors[candidate];
 	}
 	if (matches != 1) {
-		diag_text_failure(x, y, 3, used, colors, counts, matched, color_of);
 		if (fail_reason) {
 			*fail_reason = 3;
 			*fail_colors = used;
@@ -3648,25 +3332,6 @@ bool identify_text_cell_stipple(const uint32_t* source, const int source_width,
 			}
 		}
 	}
-	// 临时诊断：网点格每帧的判定依据。
-	{
-		static int stipple_logs = 0;
-		const bool in_panel = x >= 456 || (x < 176 && y >= 200);
-		if (stipple_logs < 160 && in_panel) {
-			diag("STIP x=%u y=%u used=%d c0=%06x/%d c1=%06x/%d c2=%06x/%d "
-			     "bg=%06x best_err=%d best_ink=%d ptr=%d,%d ok=%d",
-			     x, y, used, colors[0] & 0xffffffu, counts[0],
-			     used > 1 ? (colors[1] & 0xffffffu) : 0u,
-			     used > 1 ? counts[1] : 0,
-			     used > 2 ? (colors[2] & 0xffffffu) : 0u,
-			     used > 2 ? counts[2] : 0,
-			     colors[bg_i] & 0xffffffu, best_err, best_ink, pointer_x,
-			     pointer_y,
-			     (best_ink >= 0 && best_err * 25 <= CellPixels) ? 1 : 0);
-			++stipple_logs;
-		}
-	}
-
 	if (best_ink >= 0 && best_err * 25 <= CellPixels) {
 		ink = colors[best_ink];
 		if (out_phase) {
@@ -4229,45 +3894,11 @@ bool identify_ascii_cell(const uint32_t* source, const int source_width,
 		return false;
 	}
 
-	// 临时探针：认不出来时说明是哪一条判据挡住的。
-	int probe_matched = 0;
-	int probe_off     = 0;
-	int probe_paper   = 0;
-	int probe_gp      = 0;
 	// 认不出来就是认不出来。这里曾经有一条"整格正好是面板纸色就当作数字已
 	// 识别"的捷径（意为底色已铺、数字还没落笔）：对话框的纸色和面板纸色是
 	// 同一个颜色，对话框盖住整格时画面与那个中间态一模一样，这条捷径会把
 	// 高清数字画到对话框上面。中间态本来也没有可画的笔画，等游戏的 blit 或
 	// 扫描重新登记即可，不需要靠猜。
-	const auto reject  = [&](const char* why) {
-		if (frames_since_black < 500 && cell.misses < 2) {
-			diag("ASCIIFAIL since=%u f=%u x=%u y=%u dig=%u why=%s kg=%d kb=%d "
-			     "gc=%d bc=%d match=%d off=%d paper=%d gp=%d cr=%zu",
-			     frames_since_black, composite_count, cell.x, cell.y,
-			     cell.digit, why, known_glyph, known_blank, glyph_used,
-			     blank_used, probe_matched, probe_off, probe_paper, probe_gp,
-			     cover_rect_count);
-			// 每个场景留一格认不出来的原始像素，直接看它到底是外观变了、
-			// 被什么压住了，还是字形本身对不上。
-			if (!scene_probe_pix && cell.x >= 560) {
-				scene_probe_pix = true;
-				for (int row = 0; row < AsciiGlyphHeight; ++row) {
-					const auto* line = top + static_cast<size_t>(row) * source_width;
-					char buf[3 * 8 * 8 + 8] = {};
-					int used = 0;
-					for (int col = 0; col < AsciiGlyphWidth; ++col) {
-						used += std::snprintf(buf + used,
-						                      sizeof(buf) - static_cast<size_t>(used),
-						                      col ? ",%06X" : "%06X",
-						                      static_cast<unsigned>(line[col] & 0xffffffu));
-					}
-					diag("ASCIIPIX f=%u x=%u y=%u row=%d mask=%02X px=%s",
-					     composite_count, cell.x, cell.y, row, expected[row], buf);
-				}
-			}
-		}
-		return false;
-	};
 
 	// 笔画色逐个候选去试：对话框压住大半笔画时，被压住那一块的颜色可能比笔画
 	// 本身还多。所以不按出现次数直接决定，而要求它主要落在字形上。
@@ -4282,10 +3913,6 @@ bool identify_ascii_cell(const uint32_t* source, const int source_width,
 			}
 		}
 		const int matched = glyph_counts[cand];
-		if (matched > probe_matched) {
-			probe_matched = matched;
-			probe_off     = off;
-		}
 		if (matched < MinGlyphInkPixels) {
 			continue;
 		}
@@ -4304,7 +3931,7 @@ bool identify_ascii_cell(const uint32_t* source, const int source_width,
 		}
 	}
 	if (best_score < 0) {
-		return reject("noink");
+		return false;
 	}
 	ink = best_ink;
 
@@ -4320,10 +3947,9 @@ bool identify_ascii_cell(const uint32_t* source, const int source_width,
 		}
 	}
 	if (paper_best < 0) {
-		return reject("nopaper");
+		return false;
 	}
 	background = blank_colours[paper_best];
-	probe_paper = blank_counts[paper_best];
 	if (cell.colors_valid) {
 		for (int i = 0; i < blank_used; ++i) {
 			if (colour_close(blank_colours[i], cell.background) &&
@@ -4353,12 +3979,11 @@ bool identify_ascii_cell(const uint32_t* source, const int source_width,
 		}
 	}
 	const int visible_on = best_matched + glyph_paper;
-	probe_gp             = glyph_paper;
 	if (best_matched * 100 < known_glyph * 20) {
-		return reject("weak");
+		return false;
 	}
 	if (glyph_paper * 100 > visible_on * 15) {
-		return reject("paperon");
+		return false;
 	}
 
 	// 露在外面、既不是笔画色也不是纸色的像素，就是压在上面的东西（对话框、
@@ -4436,7 +4061,6 @@ bool draw_ascii_digit(const AsciiCell& cell, const uint32_t background,
 
 	// The tile is alpha only, so blending it here keeps the paper that the
 	// game painted and merely replaces the strokes.
-	int painted = 0;
 	for (int row = 0; row < DigitAtlasTileHeight; ++row) {
 		const auto* alpha_row = atlas->alpha.data() +
 		                        static_cast<size_t>(tile_y + row) *
@@ -4453,30 +4077,12 @@ bool draw_ascii_digit(const AsciiCell& cell, const uint32_t background,
 			if (alpha == 0) {
 				continue;
 			}
-			++painted;
 			const auto existing = dst[col];
 			dst[col]            = Bgrx8888(
                     blend_channel(ir, (existing >> 16) & 0xff, alpha),
                     blend_channel(ig, (existing >> 8) & 0xff, alpha),
                     blend_channel(ib, existing & 0xff, alpha));
 		}
-	}
-	// 临时诊断：右面板的每一格数字，连颜色一起记下来。对话框盖住面板数值时，
-	// 这些记录能直接说明是"格子仍在被画"还是"根本没画"；painted 是真正写进
-	// 合成缓冲的高清像素数，kept 是被 keep 掩码挡掉的源像素个数。
-	if (composite_count % 60 == 0 && cell.x >= 560) {
-		int kept = 0;
-		for (int row = 0; keep && row < AsciiGlyphHeight; ++row) {
-			for (uint8_t rest = keep[row]; rest != 0;
-			     rest &= static_cast<uint8_t>(rest - 1)) {
-				++kept;
-			}
-		}
-		diag("ASCIIDRAW f=%u x=%u y=%u digit=%u ink=%06X bg=%06X kept=%d "
-		     "painted=%d",
-		     composite_count, cell.x, cell.y, cell.digit,
-		     static_cast<unsigned>(ink & 0x00ffffffu),
-		     static_cast<unsigned>(background & 0x00ffffffu), kept, painted);
 	}
 	return true;
 }
@@ -5877,8 +5483,6 @@ void SEA2_HD_TraceDosOpen(const char* name, const uint16_t handle,
 	if (lower.find("1.pat") != std::string::npos) {
 		sea2_font_handle = handle;
 	}
-	std::snprintf(sea2_last_dos_name, sizeof(sea2_last_dos_name), "%s",
-	              lower.c_str());
 	sea2_dos_names[handle] = lower;
 	// 临时诊断：记录打开过的文件，用来对照立绘 blit 出现时加载的是哪个文件。
 	{
@@ -6173,69 +5777,6 @@ void SEA2_HD_TraceBlitterEntry(const uint16_t ip)
 		// 的整块美术就一定是压在它上面的。
 		++blit_order;
 		record_cover_rect(x, y, width, height);
-		// 临时诊断：建筑物室内左上角人物立绘区域（x 80..250, y 30..175）
-		// 的每一次 blit，记录尺寸、源段与偏移、以及当前打开的文件名，用来
-		// 定位这张立绘到底存在哪个文件、按什么尺寸拼出来。
-		{
-			const int px0 = static_cast<int>(x) * 8;
-			const int py0 = static_cast<int>(y);
-			const int pw0 = static_cast<int>(width) * 8;
-			const int ph0 = static_cast<int>(height);
-			const bool in_art = px0 < 250 && px0 + pw0 > 80 && py0 < 175 &&
-			                    py0 + ph0 > 30;
-			if (in_art) {
-				static int art_logged = 0;
-				if (art_logged < 400) {
-					diag("BLITART px=%d py=%d w=%d h=%d seg=%04X src=%04X file=%s",
-					     px0, py0, pw0, ph0, static_cast<unsigned>(source_seg),
-					     static_cast<unsigned>(source), sea2_last_dos_name);
-					++art_logged;
-				}
-			}
-		}
-		// 临时诊断：面板区域（右面板 / 左下面板）的每一次 blit，用来判断标签
-		// 到底是"字库文本"还是"整块贴图"。字体路径的 2x14 blit 由 PANELTXT 记录。
-		{
-			const int px = static_cast<int>(x) * 8;
-			const int py = static_cast<int>(y);
-			const bool in_panels = (px >= 460 && px <= 632) ||
-			                       (px < 176 && py >= 200);
-			if (in_panels && !(width == 2 && height == 14)) {
-				static int panel_logged = 0;
-				if (panel_logged < 3000) {
-					diag("PANELBLIT px=%d py=%d w=%u h=%u seg=%04X src=%04X file=%s",
-					     px, py, static_cast<unsigned>(width),
-					     static_cast<unsigned>(height),
-					     static_cast<unsigned>(source_seg),
-					     static_cast<unsigned>(source), sea2_last_dos_name);
-					++panel_logged;
-				}
-			}
-		}
-		// 临时诊断：面板区 2x14 字形的完整 28 字节，用来和 1.PAT / 2.PAT 比对。
-		if (width == 2 && height == 14) {
-			const int px = static_cast<int>(x) * 8;
-			const int py = static_cast<int>(y);
-			const bool in_panels = (px >= 460) || (px < 176 && py >= 200);
-			if (in_panels) {
-				static int panel_txt_logged = 0;
-				if (panel_txt_logged < 600) {
-					const uint16_t dseg = SegValue(ds);
-					char hex[TextGlyphBytes * 2 + 1] = {};
-					for (int i = 0; i < TextGlyphBytes; ++i) {
-						const auto byte = mem_readb(PhysicalMake(
-						        dseg, static_cast<uint16_t>(source + i)));
-						std::snprintf(hex + i * 2, 3, "%02X", byte);
-					}
-					diag("PANELTXT px=%d py=%d seg=%04X src=%04X ann=%u file=%s b=%s",
-					     px, py, static_cast<unsigned>(source_seg),
-					     static_cast<unsigned>(source),
-					     static_cast<unsigned>(pending_glyph_record),
-					     sea2_last_dos_name, hex);
-					++panel_txt_logged;
-				}
-			}
-		}
 		if (width == 2 && height == 14) {
 			const uint16_t ds_seg = SegValue(ds);
 			std::array<uint8_t, TextGlyphBytes> bitmap = {};
@@ -6328,20 +5869,6 @@ void SEA2_HD_TraceBlitterEntry(const uint16_t ip)
 			    code < AsciiTileFor + AsciiPrintableCount) {
 				register_ascii_cell(static_cast<uint16_t>(x * 8), y,
 				                    static_cast<uint8_t>(code));
-			}
-			// 临时诊断：右面板里的 8x16 半角字符（% 最可能在这里）。
-			if (static_cast<int>(x) * 8 >= 500 && y >= 150 && y <= 330) {
-				static int ascii_panel_logged = 0;
-				if (ascii_panel_logged < 300) {
-					char hex[AsciiGlyphBytes * 2 + 1] = {};
-					for (int i = 0; i < AsciiGlyphBytes; ++i) {
-						std::snprintf(hex + i * 2, 3, "%02X", bitmap[i]);
-					}
-					diag("PANELASCII px=%u py=%u code=%d b=%s",
-					     static_cast<unsigned>(x * 8),
-					     static_cast<unsigned>(y), code, hex);
-					++ascii_panel_logged;
-				}
 			}
 		}
 	}
@@ -6948,39 +6475,6 @@ void SEA2_HD_DumpFrame(const void* pixels, const int pitch, const int width,
 	SDL_FreeSurface(surface);
 }
 
-// 临时诊断：整屏黑之后连续截下游戏自己的画面，用来确认"原数字"到底出现在
-// 哪一段（验证后删掉）。
-void dump_scene_frame(const uint32_t* source, const int width, const int height,
-                      const uint32_t since)
-{
-	auto* surface = SDL_CreateRGBSurfaceWithFormat(
-	        0, width, height, 32, SDL_PIXELFORMAT_RGBA32);
-	if (!surface) {
-		return;
-	}
-	if (SDL_LockSurface(surface) == 0) {
-		for (int y = 0; y < height; ++y) {
-			auto* out = static_cast<uint8_t*>(surface->pixels) +
-			            static_cast<size_t>(y) * surface->pitch;
-			const auto* in = source + static_cast<size_t>(y) * width;
-			for (int x = 0; x < width; ++x) {
-				out[x * 4 + 0] = static_cast<uint8_t>((in[x] >> 16) & 0xff);
-				out[x * 4 + 1] = static_cast<uint8_t>((in[x] >> 8) & 0xff);
-				out[x * 4 + 2] = static_cast<uint8_t>(in[x] & 0xff);
-				out[x * 4 + 3] = 0xff;
-			}
-		}
-		SDL_UnlockSurface(surface);
-		std::filesystem::create_directories("sea2_frames");
-		char name[64] = {};
-		std::snprintf(name, sizeof(name), "sea2_frames/s_%05u_%03u.png",
-		              static_cast<unsigned>(composite_count),
-		              static_cast<unsigned>(since));
-		IMG_SavePNG(surface, name);
-	}
-	SDL_FreeSurface(surface);
-}
-
 // ---------------------------------------------------------------
 // 面板数字扫描
 //
@@ -7094,15 +6588,6 @@ int scan_panel_digits(const uint32_t* source, const int source_width)
 					register_ascii_cell(static_cast<uint16_t>(x),
 					                    static_cast<uint16_t>(y),
 					                    static_cast<uint8_t>(code));
-					// 临时诊断：前 60 个扫描结果逐个记下来，用来核对误判。
-					if (panel_scan_log_budget > 0) {
-						--panel_scan_log_budget;
-						diag("PANELHIT x=%d y=%d code=%d ink=%06X paper=%06X", x,
-						     y, code,
-						     static_cast<unsigned>(colours[ink_index] & 0xffffffu),
-						     static_cast<unsigned>(
-						             colours[1 - ink_index] & 0xffffffu));
-					}
 					++found;
 					break;
 				}
@@ -8678,9 +8163,6 @@ struct ShopPictureArt {
 
 ShopPictureArt shop_picture_art = {};
 
-// 临时诊断用：这块画是"没画 → 画上"时才写一行日志。
-bool shop_drew_last = false;
-
 // 读成合成用的 BGRX 布局（r<<16 | g<<8 | b）。
 bool load_shop_png(const std::string& path, const int width, const int height,
                    std::vector<uint32_t>& pixels)
@@ -8780,7 +8262,6 @@ void draw_shop_picture(const uint32_t* source, const int source_width,
 	}
 	// 纯黑（淡入的起点）没有可替换的内容：拟合出的增益接近 0，画出来还是黑的。
 	if (fit[0].gain < 0.02 && fit[1].gain < 0.02 && fit[2].gain < 0.02) {
-		shop_drew_last = false;
 		return;
 	}
 	const bool identity = std::abs(fit[0].gain - 1.0) < 0.001 &&
@@ -8819,15 +8300,7 @@ void draw_shop_picture(const uint32_t* source, const int source_width,
 		}
 	}
 	if (samples == 0 || same * 100 < samples * ShopPictureMinMatchPercent) {
-		shop_drew_last = false;
 		return;
-	}
-	// 临时诊断：进入建筑时这块画是从第几帧开始换成高清的（验证后清掉）。
-	if (!shop_drew_last) {
-		shop_drew_last = true;
-		diag("SHOPDRAW since=%u f=%u same=%d/%d gain=%.2f/%.2f/%.2f",
-		     frames_since_black, composite_count, same, samples, fit[0].gain,
-		     fit[1].gain, fit[2].gain);
 	}
 
 	// 逐像素替换：与低清参考（经亮度变换后）一致的才写高清，暗处的高清像素
@@ -9159,11 +8632,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 	const bool darkening          = drift_sum < -6 * LumaCells;
 	screen_fading      = have_history && whole_screen_moved &&
 	                (brightening || darkening);
-	// 临时探针：进入场景后，淡入到第几帧结束。
-	if (!scene_probe_fade && frames_since_black >= 2 && !screen_fading) {
-		scene_probe_fade = true;
-		diag("FADEDONE since=%u f=%u", frames_since_black, composite_count);
-	}
 
 	// The six fixed portrait boxes showing their picture together is what
 	// identifies the character selection screen. Only boxes that still hold that
@@ -9231,23 +8699,13 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 		drop_scene_text_state();
 		screen_has_been_lit = false;
 		frames_since_black  = 0;
-		scene_probe_ascii_left  = false;
-		scene_probe_ascii_right = false;
-		scene_probe_kao          = false;
-		scene_probe_fade         = false;
-		scene_probe_pix          = false;
 		ascii_panel_valid        = false;
 		panel_scan_pending       = true;
 		panel_scan_hash          = 0;
 		panel_scan_count         = 0;
-		diag("SCENEBLACK frame=%u", composite_count);
 	}
 	if (frames_since_black < 1000000) {
 		++frames_since_black;
-	}
-	// 临时诊断：黑屏后的前 48 帧，每隔 2 帧留一张游戏自己画面的截帧。
-	if (frames_since_black <= 48 && frames_since_black % 2 == 0) {
-		dump_scene_frame(source, source_width, source_height, frames_since_black);
 	}
 
 	// 换场景后先把面板上的数字直接扫出来：整块恢复面板时没有逐字符 blit，
@@ -9260,11 +8718,7 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 		if (panel_hash != panel_scan_hash) {
 			panel_scan_hash = panel_hash;
 			++panel_scan_count;
-			const int scanned = scan_panel_digits(source, source_width);
-			if (scanned > 0) {
-				diag("PANELSCAN since=%u f=%u found=%d", frames_since_black,
-				     composite_count, scanned);
-			}
+			scan_panel_digits(source, source_width);
 		}
 	}
 
@@ -9377,33 +8831,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				                  blend_channel(r, db, alpha)};
 			}
 		}
-
-		if (composite_count % 60 == 0) {
-			int covered_blocks = 0;
-			for (const auto mark : command.covered) {
-				covered_blocks += mark != 0 ? 1 : 0;
-			}
-			if (covered_blocks > 0) {
-				diag("HDMASK entry=%u x=%u y=%u frame=%u covered=%d",
-				     command.entry, command.x, command.y, composite_count,
-				     covered_blocks);
-			}
-		}
-	}
-
-	// 临时探针：进入新场景后，立绘要到第几帧才重新画上。
-	if (!scene_probe_kao) {
-		int shown_boxes = 0;
-		for (const auto& probe_command : draw_commands) {
-			if (probe_command.matched_last) {
-				++shown_boxes;
-			}
-		}
-		if (shown_boxes > 0) {
-			scene_probe_kao = true;
-			diag("KAODONE since=%u f=%u shown=%d total=%zu", frames_since_black,
-			     composite_count, shown_boxes, draw_commands.size());
-		}
 	}
 
 	// Simplified text glyphs are drawn after the portraits so they always win.
@@ -9416,12 +8843,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 		uint16_t pointer_x      = 0;
 		uint16_t pointer_y      = 0;
 		const bool have_pointer = MOUSEDOS_GetCursorPosition(pointer_x, pointer_y);
-		const bool log_hover    = have_pointer && composite_count % 30 == 0;
-		int hover_logged        = 0;
-		if (log_hover) {
-			diag("TXTHOVER frame=%u pointer=%u,%u cells=%zu", composite_count,
-			     pointer_x, pointer_y, text_cells.size());
-		}
 
 		// 港口信息面板与人物状态面板里的标签是游戏内联绘制的加粗美术字，
 		// 保留原字形做平滑放大，见 draw_panel_label_upscale()。
@@ -9466,14 +8887,11 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 			uint32_t background = 0;
 			uint32_t ink        = 0;
 			GlyphMask observed  = {};
-			int fail_reason     = 0;
-			int fail_used       = 0;
 			// 普通识别成功就够了：行掩码只用来判断这一格有多少像素不属于文字。
 			// 掩码为 0 表示整格都被别的东西盖住，此时照样整格画高清再逐像素
 			// 还原——看得见的部分是高清，被盖住的像素原样贴回，两者都不吃亏。
 			bool readable = identify_text_cell(source, source_width, cell.x, cell.y,
-			                                  record, background, ink, &observed,
-			                                  &fail_reason, &fail_used);
+			                                  record, background, ink, &observed);
 			if (readable) {
 				cell.row_mask = text_cell_clean_rows(source, source_width, cell.x,
 				                                     cell.y, observed, background,
@@ -9482,14 +8900,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 			if (!readable) {
 				// 网点字（不可用的菜单项）：记录号来自字库 blit，画面里只有
 				// 一半笔画。校验通过后直接按 50% 灰画高清字形，不再叠网点。
-				{
-					static int noknown_logs = 0;
-					if (!cell.known && noknown_logs < 40 &&
-					    (cell.x >= 456 || (cell.x < 176 && cell.y >= 200))) {
-						diag("STIPNOKNOWN x=%u y=%u", cell.x, cell.y);
-						++noknown_logs;
-					}
-				}
 				if (cell.known) {
 					uint32_t stipple_ink = 0;
 					uint32_t stipple_bg  = 0;
@@ -9542,28 +8952,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 						continue;
 					}
 				}
-				// 临时诊断：面板区里"已登记却读不出来"的格子，记录失败原因和
-				// 格子里的颜色数量，用来判断是颜色太多还是形状对不上。
-				const bool in_panel =
-				        cell.x >= 456 || (cell.x < 176 && cell.y >= 200);
-				if (in_panel) {
-					static std::unordered_map<uint32_t, int> panel_fail_sig = {};
-					static int panel_fail_lines = 0;
-					const uint32_t key =
-					        (static_cast<uint32_t>(cell.x) << 16) | cell.y;
-					const int sig = fail_reason * 1000 + fail_used;
-					const auto it = panel_fail_sig.find(key);
-					if ((it == panel_fail_sig.end() || it->second != sig) &&
-					    panel_fail_lines < 120) {
-						panel_fail_sig[key] = sig;
-						diag("PANELFAIL x=%u y=%u reason=%d used=%d ver=%d "
-						     "miss=%u known=%d",
-						     cell.x, cell.y, fail_reason, fail_used,
-						     cell.verified ? 1 : 0, cell.misses,
-						     cell.known ? 1 : 0);
-						++panel_fail_lines;
-					}
-				}
 				// Under the pointer a failure says nothing: the cell itself is
 				// hidden. Anywhere else the glyph really is gone, and a few such
 				// frames in a row drop the record, so a cell the screen change
@@ -9609,42 +8997,8 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 					cell.verified = false;
 				}
 			}
-			diag("TXTRESET frame=%u seen=%d vanished=%d before=%d cells=%zu",
-			     composite_count, seen_now, vanished, seen_before,
-			     text_cells.size());
-		}
-		// 临时诊断：定期列出面板区里登记过的文本格，用来确认标签到底有没有
-		// 被字库 blit 登记进来。
-		if (composite_count > 0 && composite_count % 120 == 0) {
-			static int panel_dumps = 0;
-			if (panel_dumps < 30) {
-				int listed = 0;
-				for (const auto& cell : text_cells) {
-					if (cell.x < 456 &&
-					    !(cell.x < 176 && cell.y >= 200)) {
-						continue;
-					}
-					if (listed >= 14) {
-						break;
-					}
-					diag("PANELCELL f=%u x=%u y=%u rec=%u ver=%d miss=%u "
-					     "seen=%d",
-					     composite_count, cell.x, cell.y, cell.record,
-					     cell.verified ? 1 : 0, cell.misses,
-					     cell.seen_this_frame ? 1 : 0);
-					++listed;
-				}
-				diag("PANELCELLS f=%u total=%zu listed=%d", composite_count,
-				     text_cells.size(), listed);
-				++panel_dumps;
-			}
 		}
 		for (auto& cell : text_cells) {
-			const bool near = log_hover && hover_logged < 8 &&
-			                  std::abs(static_cast<int>(pointer_x) -
-			                           static_cast<int>(cell.x)) <= 48 &&
-			                  std::abs(static_cast<int>(pointer_y) -
-			                           static_cast<int>(cell.y) - ContentYOffset) <= 48;
 			uint16_t record     = 0;
 			uint32_t background = 0;
 			uint32_t ink        = 0;
@@ -9737,11 +9091,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				}
 			}
 			if (identified == 0) {
-				if (near) {
-					diag("  TXTCELL x=%u y=%u ident=0 known=%d", cell.x, cell.y,
-					     cell.known ? 1 : 0);
-					++hover_logged;
-				}
 				continue;
 			}
 			const auto display_record = patched_text_record(cell, record);
@@ -9770,14 +9119,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				                       cell.mask, background,
 				                       cell.stipple ? cell.screen_ink : ink,
 				                       cell.stipple, cell.stipple_phase);
-			}
-			if (near) {
-				diag("  TXTCELL x=%u y=%u ident=%d record=%u disp=%u has=%d drawn=%d "
-				     "bg=%06x ink=%06x",
-				     cell.x, cell.y, identified, record, display_record,
-				     has_simplified_glyph(display_record) ? 1 : 0, drawn ? 1 : 0,
-				     background & 0xffffffu, ink & 0xffffffu);
-				++hover_logged;
 			}
 		}
 		// Numerals are a separate path and a separate cell size, so they are
@@ -9828,25 +9169,12 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				// 进行，只还原指针框会把对话框的像素漏掉。
 				cell.has_overlay = has_foreign || covered;
 				++ascii_seen;
-				// 临时诊断：右面板的格子每 60 帧记一次识别状态。对话框盖住
-				// 面板数值时，这里能直接看出格子是"完整可见"还是"只剩一点"。
-				if (composite_count % 60 == 0) {
-					diag("ASCIISTATE f=%u x=%u y=%u dig=%u foreign=%d cov=%d ink=%06X bg=%06X",
-					     composite_count, cell.x, cell.y, cell.digit,
-					     has_foreign ? 1 : 0, covered ? 1 : 0,
-					     static_cast<unsigned>(ink & 0x00ffffffu),
-					     static_cast<unsigned>(background & 0x00ffffffu));
-				}
 				continue;
 			}
 			// Under the pointer a failure says nothing: what is missing is
 			// hidden, not gone. Anywhere else the bitmap really is gone.
 			if (covered) {
 				continue;
-			}
-			if (composite_count % 60 == 0) {
-				diag("ASCIIMISS f=%u x=%u y=%u dig=%u cov=0",
-				     composite_count, cell.x, cell.y, cell.digit);
 			}
 			cell.colors_valid = false;
 			if (cell.drawn) {
@@ -9896,38 +9224,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				ascii_panel_valid = true;
 			}
 		}
-		// 临时探针：进入新场景后，左右面板的数字各自要到第几帧才重新认出来。
-		{
-			int seen_left  = 0;
-			int seen_right = 0;
-			for (const auto& probe_cell : ascii_cells) {
-				if (!probe_cell.seen_this_frame) {
-					continue;
-				}
-				if (probe_cell.x >= 560) {
-					++seen_right;
-				} else {
-					++seen_left;
-				}
-			}
-			if (!scene_probe_ascii_left && seen_left >= 3) {
-				scene_probe_ascii_left = true;
-				diag("ASCIILEFT since=%u f=%u seen=%d cells=%zu",
-				     frames_since_black, composite_count, seen_left,
-				     ascii_cells.size());
-			}
-			if (!scene_probe_ascii_right && seen_right >= 3) {
-				scene_probe_ascii_right = true;
-				diag("ASCIIRIGHT since=%u f=%u seen=%d cells=%zu",
-				     frames_since_black, composite_count, seen_right,
-				     ascii_cells.size());
-			}
-		}
-		// 一帧里多个数字格被盖住，就是对话窗/窗口刚压上来的那一刻：把这一帧
-		// 的原始画面和合成结果都留下来做对照。
-		if (ascii_vanished >= 2) {
-			snapshot_wanted = true;
-		}
 		// Several readable numbers gone at once means the screen was replaced.
 		// Everything that cannot be read right now then loses its trust, the
 		// cell the pointer happens to hide included, so a record from the
@@ -9938,10 +9234,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 					cell.colors_valid = false;
 				}
 			}
-			diag("ASCIITRUST frame=%u seen=%d vanished=%d cells=%zu",
-			     composite_count, ascii_seen, ascii_vanished,
-			     ascii_cells.size());
-			snapshot_wanted = true;
 		}
 		for (auto& cell : ascii_cells) {
 			const bool covered = have_pointer &&
@@ -9955,12 +9247,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 			const bool fully_covered = ascii_cell_cover_mask(
 			        source, source_width, cell, keep);
 			if (fully_covered) {
-				if (composite_count % 60 == 0) {
-					diag("ASCIISKIP f=%u x=%u y=%u d=%u why=full ink=%06X bg=%06X",
-					     composite_count, cell.x, cell.y, cell.digit,
-					     static_cast<unsigned>(cell.ink & 0xffffffu),
-					     static_cast<unsigned>(cell.background & 0xffffffu));
-				}
 				if (cell.drawn) {
 					cell.drawn    = false;
 					frame_rebuild = true;
@@ -9973,14 +9259,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				                                static_cast<int>(pointer_x),
 				                                static_cast<int>(pointer_y),
 				                                cell.background, cell.ink)) {
-					if (composite_count % 60 == 0) {
-						diag("ASCIISKIP f=%u x=%u y=%u d=%u why=unseen cov=%d "
-						     "valid=%d ink=%06X bg=%06X",
-						     composite_count, cell.x, cell.y, cell.digit,
-						     covered ? 1 : 0, cell.colors_valid ? 1 : 0,
-						     static_cast<unsigned>(cell.ink & 0xffffffu),
-						     static_cast<unsigned>(cell.background & 0xffffffu));
-					}
 					// The cell may hold other artwork by now, or too little
 					// of it is left to tell. It only stops being painted, so
 					// it comes back as soon as its own bitmap is on screen
@@ -10007,11 +9285,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 			                       open_paper, open_total);
 			if (open_total > 0 &&
 			    (open_ink < AsciiMinOpenInk || open_paper < AsciiMinOpenPaper)) {
-				if (composite_count % 60 == 0) {
-					diag("ASCIINOPE f=%u x=%u y=%u d=%u ink=%d paper=%d open=%d",
-					     composite_count, cell.x, cell.y, cell.digit, open_ink,
-					     open_paper, open_total);
-				}
 				if (cell.drawn) {
 					cell.drawn    = false;
 					frame_rebuild = true;
@@ -10041,31 +9314,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 		                    static_cast<int>(pointer_y));
 	}
 	++composite_count;
-	if (composite_count == 1) {
-		diag("FIRST size=%dx%d", source_width, source_height);
-	}
-	if (source_width == VgaWidth && source_height == VgaHeight &&
-	    (composite_count == 20 || composite_count == 60 ||
-	     composite_count == 150 || composite_count == 400)) {
-		diag("STATE frame=%u commands=%zu", composite_count,
-		     draw_commands.size());
-		for (auto& command : draw_commands) {
-			std::array<uint8_t, KaoRelationBytes> bits = {};
-			build_relation_bits(kao_box_origin(command, source, source_width),
-			                    source_width,
-			                    bits);
-			diag("  cmd entry=%u x=%u y=%u locked=%d stable=%u unsettled=%u structure=%d diff=%d",
-			     command.entry,
-			     command.x,
-			     command.y,
-			     command.locked ? 1 : 0,
-			     command.stable,
-			     command.unsettled,
-			     count_relation_structure(bits),
-			     command.locked ? count_relation_differences(bits, command.reference)
-			                    : -1);
-		}
-	}
 
 	// 循环里请求的"再合成一次"要留到函数返回之后才有效：这行如果无条件写 false，
 	// 刚置上的请求就被自己清掉，残留的高清瓦片只能等下一次鼠标重绘才被擦掉。

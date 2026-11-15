@@ -123,16 +123,19 @@ if (covered || cell.has_overlay) {
 这套机制不会登记任何矩形；一旦将来有整块美术走 blitter（如 KAO 肖像以外的窗口），
 它会自动生效，不需要再改。
 
-## 五、调试手段（临时诊断，长期可删）
+## 五、调试手段
 
-- 日志：工作目录下 `sea2-hd-diag.log`，每次启动截断。
-  关键标签：`ASCIICELL` / `ASCIIDRAW` / `ASCIINOPE` / `ASCIISTATE` / `ASCIIMISS` /
-  `ASCIITRUST` / `ASCIIFAIL` / `PANELSCAN` / `PANELHIT` / `PANELBLIT` / `COVERRECT`。
-- 原始帧与合成帧对照：每 30 帧在 `sea2_frames/` 下导出
-  `raw_XXXXX.png`（游戏原始 640×480）与 `out_XXXXX.png`（我们的合成结果，4 倍采样回 640×480）；
-  另外，一帧内有 ≥2 个数字格被盖住时会立刻补一对快照。
+- 日志：工作目录下 `sea2-hd-diag.log`，每次启动截断。当前保留的是状态机事件：
+  `ADD` / `SCENE LOCK` / `HIDE` / `LOCK` / `PREVIEW` / `GIVEUP` / `REFRESH` / `HEAL` /
+  `MISS` / `RELOCK` / `UNMASKED` / `MASKED` / `MATCH` / `PORT*` / `SYMBLIT` / `GLYPHMISS` /
+  `DOSOPEN` / `FILEIO`。
+- 排查数字链路时用过的探针（`ASCIICELL` / `ASCIIFAIL` / `ASCIIPIX` / `ASCIIDRAW` /
+  `ASCIISTATE` / `ASCIIMISS` / `ASCIISKIP` / `ASCIINOPE` / `ASCIITRUST` / `ASCIILEFT` /
+  `ASCIIRIGHT` / `PANELSCAN` / `PANELHIT` / `PANELBLIT` / `PANELTXT` / `PANELASCII` /
+  `KAODONE` / `FADEDONE` / `SCENEBLACK` / `SHOPDRAW` / `COVERRECT` / `TXTHOVER` 等）已在
+  验证通过后全部删除，连同 `dump_scene_frame` 的截帧与三个未使用的导出函数。
+- `sea2_frames/`：由 `sea2_hd_frame_dump` 打开的整帧导出（见 `SEA2HD.md` §5）。
 
-> `out_*.png` 是每 4 像素取一点，只能用来判断"有没有画"，不能用来判断笔画精细度。
 
 ## 六、排查过程中被否定的假设（避免重走）
 
@@ -184,3 +187,6 @@ PANELHIT x=208 y=96 code=50 ink=F3E3D2 paper=000000
 ### 验证
 
 进建筑即时高清、对话框打开时无穿透、关掉对话框后数字立即恢复、鼠标停在数字/对话框上无残影。
+
+> 上面的 `PANELHIT` / `ASCIIFAIL` / `ASCIITRUE` / `ASCIIDRAW` 等日志是排查期的探针输出，
+> 验证通过后已随 §5 列出的全部临时诊断一起删除；这段记录保留的是当时的直接证据。
