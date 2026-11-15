@@ -16,6 +16,7 @@
 #include "hardware/pci_bus.h"
 #include "hardware/port.h"
 #include "hardware/video/vga.h"
+#include "misc/sea2_hd.h"
 #include "misc/video.h"
 #include "utils/bitops.h"
 #include "utils/math_utils.h"
@@ -1180,6 +1181,11 @@ bool INT10_SetVideoMode(uint16_t mode)
 		mode -= 0x80;
 	}
 	int10.vesa_setmode=0xffff;
+	// 启动加速：MAIN.EXE 的密码界面固定使用 640x480 16 色，交给 sea2_hd 在
+	// 该模式第一次出现时自动注入回车。
+	if (mode <= 0xff) {
+		SEA2_HD_NotifyVideoMode(static_cast<uint8_t>(mode));
+	}
 	// LOG_MSG("INT10H: Setting BIOS video mode %02Xh", mode);
 
 	if (!is_machine_ega_or_better()) {

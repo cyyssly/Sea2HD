@@ -533,8 +533,18 @@ static Bitu INT16_Handler(void) {
 		SEA2_HD_TraceInt16(call_cs, call_ip, reg_ah, reg_ax);
 	}
 	uint16_t temp=0;
+	// 密码界面：用一次 Enter 直接应答键盘读取，跳过密码输入。
+	uint16_t forced_key = 0;
+	const bool skip_password =
+	        (reg_ah == 0x00 || reg_ah == 0x01 || reg_ah == 0x10 ||
+	         reg_ah == 0x11) &&
+	        SEA2_HD_TrySkipPasswordKey(forced_key);
 	switch (reg_ah) {
 	case 0x00: /* GET KEYSTROKE */
+		if (skip_password) {
+			reg_ax = forced_key;
+			break;
+		}
 		if ((get_key(temp)) && (!IsEnhancedKey(temp))) {
 			/* normal key found, return translated key in ax */
 			reg_ax=temp;
@@ -547,6 +557,10 @@ static Bitu INT16_Handler(void) {
 		}
 		break;
 	case 0x10: /* GET KEYSTROKE (enhanced keyboards only) */
+		if (skip_password) {
+			reg_ax = forced_key;
+			break;
+		}
 		if (get_key(temp)) {
 			if (((temp&0xff)==0xf0) && (temp>>8)) {
 				/* special enhanced key, clear low part before returning key */
@@ -562,6 +576,12 @@ static Bitu INT16_Handler(void) {
 		}
 		break;
 	case 0x01: /* CHECK FOR KEYSTROKE */
+		if (skip_password) {
+			reg_ax = forced_key;
+			CALLBACK_SZF(false);
+			CALLBACK_SCF(false);
+			break;
+		}
 		// enable interrupt-flag after IRET of this int16
 		CALLBACK_SIF(true);
 		for (;;) {
@@ -582,6 +602,12 @@ static Bitu INT16_Handler(void) {
 		reg_ax=temp;
 		break;
 	case 0x11: /* CHECK FOR KEYSTROKE (enhanced keyboards only) */
+		if (skip_password) {
+			reg_ax = forced_key;
+			CALLBACK_SZF(false);
+			CALLBACK_SCF(false);
+			break;
+		}
 		// enable interrupt-flag after IRET of this int16
 		CALLBACK_SIF(true);
 		if (check_key(temp)) { // check_key changes ZF and CF as required

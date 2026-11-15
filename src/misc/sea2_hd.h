@@ -44,6 +44,12 @@ uint32_t SEA2_HD_GlyphSimplified(uint16_t record);
 void SEA2_HD_VerifyGlyphMap();
 
 void SEA2_HD_SetMode(const std::string& mode, const std::string& assets_path);
+// 启动加速：MAIN.EXE 运行期间第一次切到 640x480 16 色模式（密码界面）时，
+// 标记进入密码界面，由 INT 16h 钩子返回一次回车，直接进入主菜单。
+void SEA2_HD_NotifyVideoMode(uint8_t mode);
+void SEA2_HD_SetAutoEnter(bool enabled);
+// INT 16h 钩子：密码界面期间用一次 Enter 直接应答键盘读取。
+bool SEA2_HD_TrySkipPasswordKey(uint16_t& key);
 bool SEA2_HD_IsActive();
 bool SEA2_HD_NeedsFrame();
 void SEA2_HD_AdvanceFrame();

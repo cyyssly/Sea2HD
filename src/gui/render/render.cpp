@@ -1683,6 +1683,12 @@ static void init_render_settings(SectionProp& section)
 	        "directory, which makes it possible to see which moment of a trace shows a\n"
 	        "given screen.");
 
+	auto auto_enter_prop = section.AddBool("sea2_auto_enter", Always, true);
+	auto_enter_prop->SetHelp(
+	        "Automatically press Enter once when the Uncharted Waters 2 password\n"
+	        "screen appears, so the game goes straight to the main menu\n"
+	        "('true' by default).");
+
 	string_prop = section.AddString("shader", Always, "crt-auto");
 	string_prop->SetOptionHelp(
 	        "Set an adaptive CRT monitor emulation shader or a regular shader ('crt-auto' by\n"
@@ -2876,6 +2882,7 @@ void RENDER_Init()
 	SEA2_HD_SetMode(section->GetStringLowCase("sea2_hd"),
 	                section->GetString("sea2_hd_path"));
 	SEA2_HD_SetFrameDump(section->GetInt("sea2_hd_frame_dump"));
+	SEA2_HD_SetAutoEnter(section->GetBool("sea2_auto_enter"));
 
 	set_aspect_ratio_correction(*section);
 	set_viewport(*section);
@@ -2920,6 +2927,9 @@ static void notify_render_setting_updated(SectionProp& section,
 
 	} else if (prop_name == "sea2_hd_frame_dump") {
 		SEA2_HD_SetFrameDump(section.GetInt("sea2_hd_frame_dump"));
+
+	} else if (prop_name == "sea2_auto_enter") {
+		SEA2_HD_SetAutoEnter(section.GetBool("sea2_auto_enter"));
 
 	} else if (prop_name == "aspect") {
 		set_aspect_ratio_correction(section);
