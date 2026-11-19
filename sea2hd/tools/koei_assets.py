@@ -557,8 +557,15 @@ def repack(
 ) -> None:
     source_path = game_root / f"{asset}.LZW"
     asset_root = original_root / asset
-    manifest = json.loads((asset_root / "manifest.json").read_text(encoding="utf-8"))
+    manifest_path = asset_root / "manifest.json"
+    if not manifest_path.exists():
+        manifest_path = (ROOT / "docs" / "materials" / "original" / asset /
+                         "manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     palette_path = original_root / "palettes" / f"{asset}.PAL"
+    if not palette_path.exists():
+        palette_path = (ROOT / "docs" / "materials" / "original" / "palettes" /
+                        f"{asset}.PAL")
     palette_bytes = palette_path.read_bytes()
     palette = [tuple(palette_bytes[i : i + 3]) for i in range(0, len(palette_bytes), 3)]
     archive = LS11Archive(source_path)
@@ -925,12 +932,15 @@ def build_runtime_manifest(
     }
     seen_paths: set[str] = set()
     for asset, builder in builders.items():
-        original = json.loads(
-            (original_root / asset / "manifest.json").read_text(encoding="utf-8")
-        )
-        hd = json.loads(
-            (hd_root / asset / "manifest.json").read_text(encoding="utf-8")
-        )
+        original_manifest = original_root / asset / "manifest.json"
+        if not original_manifest.exists():
+            original_manifest = (ROOT / "docs" / "materials" / "original" /
+                                 asset / "manifest.json")
+        hd_manifest = hd_root / asset / "manifest.json"
+        if not hd_manifest.exists():
+            hd_manifest = ROOT / "docs" / "materials" / asset / "manifest.json"
+        original = json.loads(original_manifest.read_text(encoding="utf-8"))
+        hd = json.loads(hd_manifest.read_text(encoding="utf-8"))
         source_file = f"{asset}.LZW"
         if (
             original.get("source_file") != source_file
@@ -1017,7 +1027,7 @@ def main() -> None:
     runtime_parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "assets" / "hd" / "runtime-manifest.json",
+        default=ROOT / "docs" / "materials" / "runtime-manifest.json",
     )
 
     repack_parser = subparsers.add_parser("repack", help="将 PNG 重新编码并回封 LS11")

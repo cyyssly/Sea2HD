@@ -251,11 +251,56 @@ DOS 鼠标是“软件光标”，由驱动直接画进游戏帧缓冲。若进�
   此时地图不可能移动，于是沿用上一帧偏移，用全窗口采样重测调色板（解释率 ≥80% 才采纳）。
   真正全黑的那一帧只剩一种颜色，会被拒绝；建筑/商店内部的关系模式完全不同，不会被误画。
 
+### 2.7 场景识别与管线门控
+
+高清管线按场景分层运行：换一个画面不必把所有参考图都比一遍。配置项
+`[render] sea2_hd_scene_gate = on` 打开后，三层各司其职：
+
+- **A 层 · 换场景检测（每帧）**：整屏逐像素全黑（各通道 ≤4，且画面此前亮过）才算一次切换。
+  触发后丢弃面板命令与文字格的颜色记忆、重置帧计数，识别从黑屏第一帧开始，不等画面完全亮起。
+  中间画面变暗不再单独作为判据：出建筑由内景缺失直接判定，不需要重跑识别。
+- **B 层 · 场景识别（切换之后）**：按固定顺序判别，非"其他"的结果要连续两帧一致才定案，
+  240 帧仍无结论则归入其他，保证一定收敛。识别期只做匹配、不绘制，避免读档界面这类
+  "与其它场景共用背景"的画面被错误替换。
+- **C 层 · 按场景跑管线**：见下方门控矩阵。
+
+判别顺序与依据：
+
+| 顺序 | 场景 | 判据 |
+|---|---|---|
+| 1 | 主菜单 | 文字：认出的汉字里出现"開始新航海 / 开始新航海"。不用参考图，比整屏比对便宜，也不受淡入亮度影响 |
+| 2 | 港口 | 左上角（`y<=40`、`x<=200`）连续 4 个数字格构成 `1[56]xx`（ASCII 万位 `1`、千位 `5`/`6`） |
+| 3 | 海上 | 同样的数字形状，位置在右上角（`x>=440`） |
+| 4 | 新游戏 | 六框头像关系位（`portrait_scene_active`） |
+| 5 | 其他 | 以上都不命中，或识别超时 |
+
+建筑内没有独立场景：它同样把日期画在左上角，无法与港口从日期区分，因此作为港口的
+子状态 `scene_in_building` 处理：
+
+- **进入**：识别期、或港口定案后 30 帧内命中某张 `SCENES` 内景。之后再命中也不改变场景，
+  因为港口画面中途偶尔也能拼出某张内景。
+- **退出**：建筑内连续 3 帧认不出内景。建筑里的对话框实测不会遮住内景那一块，
+  所以这个判据不会被对话或菜单误触发。
+- **管线**：港口画港口框，建筑内只画内景；建筑内认不出内景时什么都不画，不会把港口框叠进去。
+
+门控矩阵（识别期与 `Unknown` 状态例外，仍跑全部管线）：
+
+| 场景 | 运行的管线 |
+|---|---|
+| 港口 | 港口框、内景（已进建筑时）、舰船图、面板数字补扫 |
+| 建筑内 | 内景（不画港口框） |
+| 海上 | 海上框、舰船图、面板数字补扫 |
+| 新游戏 | 新游戏整屏图 |
+| 其他 / 未知 | 只保留 4x 兜底、亮度/黑屏/窗口、立绘、汉字文字格、ASCII 数字 |
+
+场景判定与进出建筑写进 `sea2-hd-diag.log`：`SEA2HD: SCENE=Port`、
+`SEA2HD: SCENE=Building`、`SEA2HD: SCENE=Port (left building)`。
+
 ## 3. 仓库结构
 
 ```
 SEA2HD.md                 本文档
-src/misc/sea2_hd.cpp      高清合成核心（头像/字形/港口地图识别与覆盖、文字悬停、指针联动）
+src/misc/sea2_hd.cpp      高清合成核心（场景识别与门控、头像/字形/港口地图识别与覆盖、文字悬停、指针联动）
 src/misc/sea2_hd.h        对外接口
 src/misc/sea2_glyph_map.h 字形记录 -> Unicode 映射表
 src/gui/render/render.cpp 渲染管线挂接（4x 输出、帧缓存）
@@ -337,24 +382,40 @@ sea2_hd_frame_dump = 5     ; 每 5 帧把 640x480 帧缓冲写入 sea2_frames/f_
 
 ```
 assets/
-  original/                 从原作解包的低分辨率原始数据（KAO/PORTCHIP/1.PAT 等）
-  hd/
-    runtime-manifest.json   运行时清单
+  original/                 游戏原图，按模块分目录（KAO/PORTCHIP/PORTMAP/FRAMES/SCENES/SHIPS 等）
+  hd/                       高清替换图，与 original 保持相同的相对路径和文件名；
+                            读取时 hd 里存在同名文件就用它，否则用 original
     simplified_atlas.png    简体字形图集
-    palettes/               调色板
+    font2_atlas.png         2.PAT 二级字形图集
     KAO/
       portraits/            KAO64 头像 256x320 4x PNG
       sheets/               KAO48 48x48 -> 192x192
       discoveries/          发现物图标
       items/                物品图标
-      manifest.json
-    PORTCHIP/               港口芯片图
-      symbols/sym-NN.png    符号图块（门口招牌、井、十字等）的 64x64 4x 最近邻规范图，
-                            按像素去重（同一张图在 5~7 套图集里各占一个槽位）；
-                            symbols.json 的 map 给出 "entry/tile" -> "sym-NN" 的对应
-    PORTMAP/                港口整图：NNN.png 为日间基准（重绘输入），NNN_<时段>.png 为同一地图的
-                            其它配色（如 002_dawn / 002_eve / 002_night），NNN_hd.png 为 6144x6144 高清图
+    PORTCHIP/               港口芯片图（tiles/sheets 与 original 同名）
+      symbols/sym-NN.png    符号图块（门口招牌、井、十字等）的 64x64 4x 规范图，
+                            按像素去重（同一张图在 5~7 套图集里各占一个槽位）
+    PORTMAP/                港口整图：NNN.png 为 6144x6144 高清图
 ```
+
+`original/` 内的对应文件：
+
+```
+original/FRAMES/<名字>.png     整屏界面低清参考 640x400
+original/SCENES/<编号>.png     内景小画低清参考 136x112
+original/SHIPS/<名字>.png      船图低清参考 128x96
+original/PORTMAP/NNN.png       港口整图的日间基准；NNN_<时段>.png 为同一地图的
+                               其它配色（如 002_dawn / 002_eve / 002_night）
+original/KAO/...               低分辨率原图（与 hd 同名）
+original/PORTCHIP/...          低级芯片图（与 hd 同名）
+```
+
+非运行时素材（指南图、中间画布、webp 原图、生图提示词、清单与生成脚本的产物）
+统一放在 `docs/materials/`。其中 `docs/materials/original/` 保存从 `assets/original`
+移出的解包索引与预览件：各模块的 `manifest.json`、`contact-*.png`、`.npy` 瓦片索引、
+`PORTMAP/maps/`、`palettes/`、`_original-en/`。`docs/materials/KAO/` 还保存
+`bin/`（KAO.LZW 逐条目解压的无损原始字节）与 `sheets/`（分类预览拼图），两者只
+用于核对与复查，运行时不需要；`sheets/` 可由 `bin/` 重新生成。
 
 对应生成脚本：
 
@@ -369,14 +430,15 @@ assets/
 | `sea2hd/tools/portchip_cluster_check.py` | 材质聚类方案的还原误差验证 |
 | `sea2hd/tools/portchip_material_swap_test.py` | 水/沙/草材质替换的最小验证（边界无缝性与地图可读性） |
 | `sea2hd/tools/port_symbols.py` | 提取符号类图块（门口招牌、井、十字等），去重成规范图并生成槽位映射表 |
-| `sea2hd/tools/port_symbols_apply.py` | 把重绘的 `sym-NN_hd.png` 按 slot 贴回 `PORTMAP/NNN_hd.png` 的对应 64x64 区块 |
+| `sea2hd/tools/port_symbols_apply.py` | 把重绘的 `sym-NN.png` 按 slot 贴回 `PORTMAP/NNN.png` 的对应 64x64 区块 |
 
 脚本默认以 `assets/` 与 `tools/` 位于同一项目根目录，且 `Pillow` 可用。
 
 ## 7. 诊断
 
-- `sea2-hd-diag.log`：`sea2-hd.conf` 同目录，记录 `ADD` / `SCENE LOCK` / `HIDE pointer…` /
-  每框 `covered`、`diff` 等事件，用于确认识别与替换是否干净。
+- `sea2-hd-diag.log`：`sea2-hd.conf` 同目录，记录 `ADD` / `SCENE` / `HIDE pointer…` /
+  每框 `covered`、`diff` 等事件，用于确认识别与替换是否干净。`SEA2HD: SCENE=…` 标明
+  每次换场景的定案结果与帧号，`(left building)` 表示从建筑返回港口。
 - 港口地图相关事件：`PORTMAP`（地图就绪）、`PORTSTATE`（可见状态切换）、`PORTREL` / `PORTRELMAP`
   （关系哈希命中的偏移与实测色对）、`PORTPANEL`（消息框遮挡）、`PORTFADE`（渐变保位）、
   `PORTDROP`（本帧交回游戏）、`PORTMISS`（搜索失败时的窗口主色）。

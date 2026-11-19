@@ -1683,6 +1683,13 @@ static void init_render_settings(SectionProp& section)
 	        "directory, which makes it possible to see which moment of a trace shows a\n"
 	        "given screen.");
 
+	auto scene_gate_prop = section.AddBool("sea2_hd_scene_gate", Always, false);
+	scene_gate_prop->SetHelp(
+	        "Only run the HD pipelines that the current scene needs ('false' by\n"
+	        "default). The scene is identified after every black screen; while the\n"
+	        "scene is still unknown every pipeline runs, so recognition never loses\n"
+	        "its inputs.");
+
 	auto auto_enter_prop = section.AddBool("sea2_auto_enter", Always, true);
 	auto_enter_prop->SetHelp(
 	        "Automatically press Enter once when the Uncharted Waters 2 password\n"
@@ -2882,6 +2889,7 @@ void RENDER_Init()
 	SEA2_HD_SetMode(section->GetStringLowCase("sea2_hd"),
 	                section->GetString("sea2_hd_path"));
 	SEA2_HD_SetFrameDump(section->GetInt("sea2_hd_frame_dump"));
+	SEA2_HD_SetSceneGate(section->GetBool("sea2_hd_scene_gate"));
 	SEA2_HD_SetAutoEnter(section->GetBool("sea2_auto_enter"));
 
 	set_aspect_ratio_correction(*section);
@@ -2927,6 +2935,9 @@ static void notify_render_setting_updated(SectionProp& section,
 
 	} else if (prop_name == "sea2_hd_frame_dump") {
 		SEA2_HD_SetFrameDump(section.GetInt("sea2_hd_frame_dump"));
+
+	} else if (prop_name == "sea2_hd_scene_gate") {
+		SEA2_HD_SetSceneGate(section.GetBool("sea2_hd_scene_gate"));
 
 	} else if (prop_name == "sea2_auto_enter") {
 		SEA2_HD_SetAutoEnter(section.GetBool("sea2_auto_enter"));

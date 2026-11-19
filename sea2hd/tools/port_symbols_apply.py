@@ -1,23 +1,23 @@
 """把人工重绘的符号贴回港口高清图。
 
-港口高清图 `PORTMAP/NNN_hd.png` 是整张 6144x6144 的重绘结果，其中画在地面上的标志物
+港口高清图 `PORTMAP/NNN.png` 是整张 6144x6144 的重绘结果，其中画在地面上的标志物
 （门口招牌、井、十字等）也在里面，被生成式重绘改得面目全非。本工具按 tile id 把这些
-区块重新覆盖成 `PORTCHIP/symbols/sym-NN_hd.png`，其余像素一律不动。
+区块重新覆盖成 `PORTCHIP/symbols/sym-NN.png`（assets/hd 下的人工重绘版），其余像素一律不动。
 
 约定：
-    assets/hd/PORTCHIP/symbols/sym-NN_hd.png   人工重绘的符号，64x64（16x16 tile 的 4x）
-                                               允许其它尺寸，会按 LANCZOS 缩到 64x64
-                                               文件名写成 sym01_hd.png 也认
-    assets/hd/PORTCHIP/symbols/sym-NN.png      原作基准，工具生成，不要改
+    assets/hd/PORTCHIP/symbols/sym-NN.png       人工重绘的符号，64x64（16x16 tile 的 4x）
+                                                允许其它尺寸，会按 LANCZOS 缩到 64x64
+                                                文件名写成 sym01.png 也认
+    assets/original/PORTCHIP/symbols/sym-NN.png 原作基准，工具生成，不要改
     槽位与规范图的对应关系见 docs/materials/symbols.json 的 map
 
 用法：
     python port_symbols_apply.py                列出哪些地图用到已有重绘符号（不写文件）
     python port_symbols_apply.py --map 002      只贴这一张
-    python port_symbols_apply.py --all          贴所有已经有 _hd.png 的地图
+    python port_symbols_apply.py --all          贴所有已经有高清图的地图
 
-`--map` 指定的地图如果还没有 `_hd.png`，会用原作按 4x 最近邻铺一张出来，方便先看符号
-效果；之后 AI 重绘出 `NNN_hd.png` 覆盖即可。
+`--map` 指定的地图如果还没有高清图，会用原作按 4x 最近邻铺一张出来，方便先看符号
+效果；之后 AI 重绘出 `NNN.png` 覆盖即可。
 """
 import json
 import sys
@@ -41,7 +41,6 @@ from koei_assets import LS11Archive, PORTCHIP_PALETTES, decode_planar
 MAT = ROOT / "docs" / "materials"
 SYM = ROOT / "assets" / "hd" / "PORTCHIP" / "symbols"
 ART = ROOT / "assets" / "hd" / "PORTMAP"
-
 GRID = 96           # 一张港口图 96x96 个 tile
 STEP = 16           # 原版 tile 边长
 SCALE = 4           # HD 倍率
@@ -83,15 +82,15 @@ def entry_of(index):
 
 
 def original_pixels(index):
-    """原作整图 1536x1536，用于还没有 _hd.png 时铺预览底。"""
+    """原作整图 1536x1536，用于还没有高清图时铺预览底。"""
     px = colour[atlas_of(index)][maps[index]]
     return px.transpose(0, 2, 1, 3, 4).reshape(GRID * STEP, GRID * STEP, 3)
 
 
 # ---------------------------------------------------------------- 重绘符号
 icons = {}
-for path in sorted(SYM.glob("sym*_hd.png")):
-    digits = path.stem[3:-3].lstrip("-_ ")
+for path in sorted(SYM.glob("sym*.png")):
+    digits = path.stem[3:].lstrip("-_ ")
     if not digits.isdigit():
         continue
     im = Image.open(path).convert("RGBA")
@@ -103,7 +102,7 @@ for path in sorted(SYM.glob("sym*_hd.png")):
     icons[f"sym-{int(digits):02d}"] = im
 
 if not icons:
-    print(f"注意：{SYM} 下还没有 sym-NN_hd.png")
+    print(f"注意：{SYM} 下还没有 sym-NN.png")
 
 
 def symbols_in(index):
@@ -120,14 +119,14 @@ def symbols_in(index):
 
 
 def base_art(index, preview):
-    path = ART / f"{index:03d}_hd.png"
+    path = ART / f"{index:03d}.png"
     if path.exists() or not preview:
         im = Image.open(path).convert("RGB")
         if im.size != (SIZE_HD, SIZE_HD):
             raise SystemExit(f"{path.name} 尺寸 {im.size}，应为 {SIZE_HD}x{SIZE_HD}")
         return im, path
     src = Image.fromarray(original_pixels(index))
-    print(f"  {index:03d} 还没有 _hd.png，用原作 4x 最近邻铺底")
+    print(f"  {index:03d} 还没有高清图，用原作 4x 最近邻铺底")
     return src.resize((SIZE_HD, SIZE_HD), Image.NEAREST), path
 
 
@@ -161,7 +160,7 @@ def opt(name):
 want = opt("--map")
 if want or "--all" in args:
     if not icons:
-        raise SystemExit(f"{SYM} 下没有 sym-NN_hd.png，先放一张重绘的符号再运行")
+        raise SystemExit(f"{SYM} 下没有 sym-NN.png，先放一张重绘的符号再运行")
     if want:
         index = int(want)
         if not 0 <= index < len(maps):
@@ -169,7 +168,7 @@ if want or "--all" in args:
         apply(index, preview=True)
     else:
         for i in range(len(maps)):
-            if (ART / f"{i:03d}_hd.png").exists():
+            if (ART / f"{i:03d}.png").exists():
                 apply(i, preview=False)
 else:
     # 列出每个符号被哪些地图用到，方便挑一张进游戏看效果。

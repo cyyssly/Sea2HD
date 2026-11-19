@@ -22,7 +22,7 @@
 输出：
     docs/materials/symbols.json          规范图清单、槽位映射表与每套图集的指标
     docs/materials/symbols-ref.png       规范图核对表（人工检查用）
-    assets/hd/PORTCHIP/symbols/sym-NN.png   规范图，4x 最近邻（64x64）
+    assets/original/PORTCHIP/symbols/sym-NN.png   规范图，4x 最近邻（64x64）
 
 同一张图在 5~7 套图集里各有一份（槽位号不同），按像素内容合并成一张规范图；地图里存的
 槽位号用 symbols.json 的 map（"000/083" -> "sym-01"）找回对应的规范图。
@@ -54,7 +54,7 @@ from koei_assets import LS11Archive, PORTCHIP_PALETTES, decode_planar
 
 MAT = ROOT / "docs" / "materials"
 MAT.mkdir(parents=True, exist_ok=True)
-LIB = ROOT / "assets" / "hd" / "PORTCHIP" / "symbols"
+LIB = ROOT / "assets" / "original" / "PORTCHIP" / "symbols"
 OVERRIDES = MAT / "symbols-overrides.json"
 
 # ---------------------------------------------------------------- 判定门槛
@@ -227,7 +227,7 @@ slot = {f"{entry_ids[a]:03d}/{t:03d}": canon_id[(a, t)] for a, t in sorted(picke
 # ---------------------------------------------------------------- 高清图标库
 LIB.mkdir(parents=True, exist_ok=True)
 # 先清空旧的规范图，避免规则变动后留下已经不算符号的图块。
-# 只匹配 sym-NN.png：同目录下人工重绘的 sym-NN_hd.png 必须保留。
+# 只匹配 sym-NN.png：人工重绘的 sym-NN.png 在 assets/hd 下，不会受影响。
 for old in LIB.glob("sym-??.png"):
     old.unlink()
 for inst in families:
@@ -265,8 +265,8 @@ manifest = {
     "rule": {"shared_atlases": SharedAtlases, "shared_rate": SharedRate,
              "dark_background": DarkBackground, "min_colours": MinColours,
              "min_blob": MinBlob},
-    "library": "assets/hd/PORTCHIP/symbols/{id}.png",
-    "hd_library": "assets/hd/PORTCHIP/symbols/{id}_hd.png",
+    "library": "assets/original/PORTCHIP/symbols/{id}.png",
+    "hd_library": "assets/hd/PORTCHIP/symbols/{id}.png",
     "hd_size": 64,
     "map": slot,
     "canonical": canon,

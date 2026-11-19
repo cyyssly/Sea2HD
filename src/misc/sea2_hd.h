@@ -44,6 +44,9 @@ uint32_t SEA2_HD_GlyphSimplified(uint16_t record);
 void SEA2_HD_VerifyGlyphMap();
 
 void SEA2_HD_SetMode(const std::string& mode, const std::string& assets_path);
+// 场景门控：打开后，稳态只运行当前场景需要的高清管线；换场景后的
+// 识别期仍然全部运行。关闭时行为与未加门控完全一致。
+void SEA2_HD_SetSceneGate(bool enabled);
 // 启动加速：MAIN.EXE 运行期间第一次切到 640x480 16 色模式（密码界面）时，
 // 标记进入密码界面，由 INT 16h 钩子返回一次回车，直接进入主菜单。
 void SEA2_HD_NotifyVideoMode(uint8_t mode);
@@ -61,6 +64,13 @@ void SEA2_HD_TraceKaoEntry(uint16_t ip);
 
 void SEA2_HD_Composite(const uint32_t* source, int source_width, int source_height,
                        uint32_t* destination, int destination_pitch);
+
+// 640x480 16 色（mode 12h）显存写入跟踪。VGA_UnchainedEGA_Handler 每写一个
+// planar 字节调用一次，用来识别不经过 blitter 的大块窗口填充。关闭 HD 时该
+// 开关为 false，页处理器里只剩一次布尔判断。
+extern bool sea2_hd_vga_write_trace;
+void SEA2_HD_NoteVgaWrite(uint32_t planar_offset, uint8_t plane_mask,
+                          uint16_t cs, uint16_t ip);
 
 // Reconnaissance switch: while tracing, save the 640x480 frame buffer as a PNG
 // every N frames (0 turns it off) so a screen can be looked at next to the

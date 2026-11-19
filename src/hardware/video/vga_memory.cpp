@@ -14,6 +14,7 @@
 #include "cpu/cpu.h"
 #include "cpu/paging.h"
 #include "hardware/memory.h"
+#include "misc/sea2_hd.h"
 #include "hardware/pic.h"
 #include "hardware/port.h"
 #include "utils/mem_host.h"
@@ -36,6 +37,16 @@
 #define CHECKED3(v) ((v)&(vga.vmemwrap-1))
 #define CHECKED4(v) ((v)&((vga.vmemwrap>>2)-1))
 
+// 把 VGA 序列器的 map mask 压成 4 位平面掩码，供 Sea2HD 的显存写入跟踪记账。
+static uint8_t Sea2HdPlaneMask()
+{
+	uint8_t planes = 0;
+	if (vga.config.full_map_mask & 0x0000000fu) planes |= 0x1;
+	if (vga.config.full_map_mask & 0x00000f00u) planes |= 0x2;
+	if (vga.config.full_map_mask & 0x000f0000u) planes |= 0x4;
+	if (vga.config.full_map_mask & 0x0f000000u) planes |= 0x8;
+	return planes;
+}
 
 #ifdef VGA_KEEP_CHANGES
 #define MEM_CHANGED( _MEM ) vga.changes.map[ (_MEM) >> VGA_CHANGE_SHIFT ] |= vga.changes.writeMask;
@@ -277,6 +288,11 @@ public:
 class VGA_UnchainedEGA_Handler : public VGA_UnchainedRead_Handler {
 public:
 	void writeHandler(PhysPt start, uint8_t val) {
+		if (sea2_hd_vga_write_trace) {
+			SEA2_HD_NoteVgaWrite(static_cast<uint32_t>(start),
+			                     Sea2HdPlaneMask(), SegValue(cs),
+			                     static_cast<uint16_t>(reg_eip));
+		}
 		uint32_t data=ModeOperation(val);
 		/* Update video memory and the pixel buffer */
 		VgaLatch pixels;
