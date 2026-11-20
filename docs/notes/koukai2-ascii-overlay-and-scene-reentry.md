@@ -76,28 +76,29 @@ if (open_total > 0 &&
 > `keep` 的判定必须严格相等。给一点容差（早期用过 `colour_close`，±8），对话框和按钮就会
 > 被当成"自己的像素"，高清数字立刻穿透。
 
-### 2. 换场景：保留数字格，只作废颜色记忆
+### 2. 换场景：文字格整体清空
 
-`drop_scene_text_state()` 里**不再 `ascii_cells.clear()`**，改为逐格重置：
+`drop_scene_text_state()` 里**不再保留数字格**，`ascii_cells` 整体清空（与
+`text_cells` 一致）：
 
 ```cpp
-for (auto& cell : ascii_cells) {
-    cell.colors_valid    = false;
-    cell.seen_this_frame = false;
-    cell.has_overlay     = false;
-    cell.drawn           = false;
-    cell.misses          = 0;
+void drop_scene_text_state()
+{
+    text_cells.clear();
+    ascii_cells.clear();
+    // 上一场景的窗口矩形与绘制次序同样作废
+    cover_rect_count = 0;
+    blit_order       = 0;
+    window_rect_count = 0;
+    window_order      = 0;
+    ...
 }
 ```
 
-原因：建筑物里的面板是静态的，游戏只把数字画一次、之后不再重画。
-如果换场景时把格子删掉，这些格子就再也登记不回来，数字会一直停在低清，
-直到游戏碰巧重画那一行——这正是"进入建筑物后过一会才变高清"的根因。
-
-保留位置与数字本身是安全的：每一帧仍会用当前帧缓冲核对字形，
-对不上的格子不会绘制，因此上一场景的数字不会残留到新画面。
-
-`text_cells`（汉字）仍然整体清空，未做同样处理。
+> 历史：早期版本曾逐格重置 `ascii_cells`（只清 `colors_valid` / `seen_this_frame`
+> 等标志）以适配"建筑里面板数字只画一次"的情况。现在的遮挡与文字归属改由
+> 绘制次序 + 矩形级判定决定（见 `koukai2-graph-pipeline-2026-11-21.md`），
+> 不再依赖跨场景保留的格子，因此回到整体清空。
 
 ### 3. 指针压住时仍然整格重画 + 逐像素还原
 

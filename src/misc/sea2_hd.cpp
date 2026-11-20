@@ -692,6 +692,8 @@ uint32_t blit_order     = 0;
 
 // 诊断文件定义在下面，这里先声明，供登记矩形时的临时记录使用。
 void diag(const char* format, ...);
+// GRAPH 管线（计算器这类整块位图窗口）在场景资源重载时要一起清掉。
+void reset_graph_arts();
 
 void cover_rect_sample_point(const CoverRect& rect, const int index, int& x,
                              int& y)
@@ -1283,6 +1285,12 @@ void diag(const char* format, ...)
 	}
 	va_list args;
 	va_start(args, format);
+	// 加壁钟时间：合成帧数只在画面有变化时才增长，静态画面停留多久都不会
+	// 增加，所以必须用真实时间才能对人眼观察到的现象。
+	static const auto diag_epoch = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(
+	        std::chrono::steady_clock::now() - diag_epoch).count();
+	std::fprintf(diag_file, "[%7.3f] ", elapsed);
 	std::vfprintf(diag_file, format, args);
 	va_end(args);
 	std::fputc('\n', diag_file);
@@ -1605,6 +1613,7 @@ void reset_assets()
 	port_map_miss_logs = 0;
 	port_map_panel_ready = false;
 	port_map_drew_last = false;
+	reset_graph_arts();
 }
 
 const Asset* get_kao64_asset(const uint16_t entry)
@@ -5177,7 +5186,10 @@ constexpr int WindowRingSideMinPercent    = 25;
 // 对话框贴着面板时，它有一整条边会和相邻纸面同色，最弱那条边的比例必然很低。
 // 只要整体边框足够强，仍然认定它是窗口，否则真正的对话框永远登记不上，
 // "窗口覆盖范围内停画"就无从谈起。
-constexpr int WindowRingStrongPercent     = 70;
+// 建筑里的固定菜单框（市场商品列表等）也有一面与面板同色，实测整体边框
+// 67%、最弱边 12%，因此整体门限取 60%。误登记的代价已经很小：真正属于框体
+// 自己的重绘会在 rect_is_overlay / RECTKEEP 那一步被撤回。
+constexpr int WindowRingStrongPercent     = 60;
 constexpr int WindowBorderMismatchPercent = 35;
 constexpr int WindowMinExposedSamples     = 8;
 constexpr int WindowLostFrames            = 2;
@@ -5185,6 +5197,10 @@ constexpr int WindowCandidateAge          = 4;
 constexpr int WindowMaxScreenPercent      = 60;
 // 判定"被窗口盖住"时向外放宽几像素，把窗口自己那一圈边框也算进去。
 constexpr int WindowOcclusionMargin       = 3;
+// 一个写入矩形内部有多少比例的像素与参考框体对不上，才算它真的压在框体上。
+// 面板换数值、刷新时几乎全对得上（只剩几个数字格），菜单 / 对话框会带来
+// 大量新像素。这个判断只在矩形上做一次，不逐格决定画不画。
+constexpr int WindowRectOccludePercent    = 12;
 
 constexpr size_t MaxWindows          = 16;
 constexpr size_t MaxWindowCandidates = 8;
@@ -5213,6 +5229,17 @@ struct WindowRect {
 std::array<WindowRect, MaxWindows> window_rects = {};
 size_t window_rect_count = 0;
 uint32_t window_order = 0;
+
+// 整屏框体（港口 / 航海 / 建筑）最近一次被重绘时的绘制次序。比它早的写入
+// 都属于更早的画面，不可能还盖在框体上面，一律不当作遮挡。
+uint32_t frame_base_order = 0;
+// 只有真的见过一次整屏框体重绘，frame_base_order 才有意义。建筑内往往一次
+// 都没有（子场景复用港口框体），这时不能拿 0 去过滤次序为 0 的早期窗口。
+bool frame_base_known = false;
+// 本帧逐个窗口矩形判定"它真的压在框体上"的结果（1=遮挡，0=其实只是框体
+// 自己重画的一块）。window_restore_pixels 据此决定要不要恢复成 4 倍原始像素。
+std::array<uint8_t, MaxWindows> window_occludes = {};
+bool window_occludes_valid = false;
 
 struct WindowCandidate {
 	int x0 = 0;
@@ -6792,6 +6819,9 @@ void SEA2_HD_SetMode(const std::string& mode, const std::string& assets_path)
 	if (!hd_enabled) {
 		window_rect_count = 0;
 		window_order      = 0;
+		frame_base_order  = 0;
+		frame_base_known  = false;
+		window_occludes_valid = false;
 		for (auto& candidate : window_candidates) {
 			candidate = {};
 		}
@@ -6839,6 +6869,14 @@ bool SEA2_HD_NeedsFrame()
 	// therefore low resolution) as long as the screen does not change.
 	for (const auto& command : draw_commands) {
 		if (!command.locked && command.unsettled < KaoSettleGiveUpFrames) {
+			return true;
+		}
+	}
+	// 候选矩形要"年龄"到 WindowCandidateAge 才登记为窗口，而年龄只在合成
+	// 时增长。画面画完就不再变化（静态菜单）时，没有这一条就永远凑不满，
+	// 菜单既登记不上、也无从核对。
+	for (const auto& candidate : window_candidates) {
+		if (candidate.used) {
 			return true;
 		}
 	}
@@ -8621,14 +8659,12 @@ constexpr int FramePictureX      = 0;
 constexpr int FramePictureY      = 40;
 constexpr int FramePictureWidth  = 640;
 constexpr int FramePictureHeight = 400;
-// 识别门限：掩码格里与低清参考一致的比率。对话框会盖掉掩码区的一块，门限
-// 定得比内景宽（50%）：够把别的界面 / 黑屏 / 淡入淡出挡在外面，又不至于在
-// 开着对话框时整张高清界面一起消失。
-constexpr int FramePictureMinMatchPercent = 50;
-// 平均亮度低于这个值（0..255）视为淡入起点/纯黑：量化过粗，颜色对应
-// 关系不可信，不参与识别。
+// 逐格守卫：按拟合出的亮度变换预测这一格该是什么色，与实机色逐通道差之和
+// 超过这个值就认为它被菜单高亮、对话框或指针盖住了，保持游戏原样不画高清。
+constexpr int FramePicturePixelTolerance = 24;
+// 平均亮度低于这个值（0..255）视为淡入起点/纯黑：没有可替换的内容。
 constexpr int FramePictureDarkLuma = 6;
-// HD 图至少要有这么多比例的不透明像素才加载：刚建的空白画布不该参与识别。
+// HD 图至少要有这么多比例的不透明像素才加载：刚建的空白画布不该参与绘制。
 constexpr int FramePictureMinCoverPercent = 5;
 
 struct ScenePictureArt {
@@ -8645,10 +8681,6 @@ struct ScenePictureArt {
 	// true = 整屏界面（FRAMES）：HD 图的 alpha 通道同时充当识别掩码与绘制
 	// 掩码，不走内景那套调色板分组识别。
 	bool masked = false;
-	// 命中的整屏图是否让字形管线让位（文字已经烘焙进 HD 图里时）。
-	// NEWGAME 这类只替换底图的整屏图必须为 false：角色名等是运行时由
-	// 字形管线画的，让位就会退回低清。
-	bool text_yield = false;
 	// true = 只作场景识别基准，不绘制：可以没有同名高清图。
 	bool recognize_only = false;
 	std::vector<uint32_t> low  = {};
@@ -8665,18 +8697,29 @@ struct ScenePictureArt {
 std::vector<ScenePictureArt> scene_pictures   = {};
 bool scene_pictures_attempted                 = false;
 
-// 本帧是否有整屏界面图（FRAMES：港口/航海）识别命中。字形管线用它做
-// 让位判定：命中的图上，落在 HD 图不透明区里的文字格由整图负责，字形
-// 管线不重画；其余画面（对话框、菜单、内景、中央动态窗口上的文字）
-// 照常走字形高清。
-bool frame_picture_active                     = false;
-const ScenePictureArt* frame_picture_art      = nullptr;
-// 本帧命中的内景小画（SCENES），供场景识别读取；不参与字形让位。
-const ScenePictureArt* scene_picture_art      = nullptr;
-// 本帧命中率（0..100），供场景识别在暗处提前定案。每帧开头清零。
-int frame_picture_match_percent = 0;
-// 识别期只匹配不绘制：见 draw_scene_pictures。
-bool frame_picture_draw_suppressed = false;
+// 本帧命中的内景小画（SCENES），供场景识别读取。
+const ScenePictureArt* scene_picture_art = nullptr;
+
+// 本帧已经被高清素材（立绘、内景小画）占据的源像素。
+//
+// 游戏里的窗口是"先铺一整块底、再在上面画立绘/内景"，VGA 写追踪拿到的
+// 窗口矩形因此把之后才画上去的立绘也包在里面。window_restore_pixels 若
+// 按矩形整块恢复，就会把高清立绘/内景改回 4x 原始像素 —— 这正是对话框
+// 和主菜单里人物立绘时有时无、开几次后几乎必然失效的原因。
+// 画过高清素材的位置记在这里，恢复窗口像素时跳过。
+std::array<uint8_t, VgaWidth * VgaHeight> hd_art_mask = {};
+
+void mark_hd_art(const int x, const int y, const int width, const int height)
+{
+	const int x0 = std::max(0, x);
+	const int y0 = std::max(0, y);
+	const int x1 = std::min(VgaWidth, x + width);
+	const int y1 = std::min(VgaHeight, y + height);
+	for (int py = y0; py < y1; ++py) {
+		auto* row = hd_art_mask.data() + static_cast<size_t>(py) * VgaWidth;
+		std::fill(row + x0, row + x1, static_cast<uint8_t>(1));
+	}
+}
 
 // 读成合成用的 BGRX 布局（r<<16 | g<<8 | b）。
 bool load_shop_png(const std::string& path, const int width, const int height,
@@ -8784,7 +8827,8 @@ void build_scene_palette(ScenePictureArt& art)
 //   assets/hd/<目录>/<名字>.png         4 倍高清图
 // SHOP / SCENES：内景小画 136x112，落点 (104,56)，HD 不带 alpha。
 // FRAMES：整屏界面 640x400，落点 (0,40)，HD 必须带 alpha——alpha >= 50%
-// 的像素才参与识别与绘制，中央动态窗口与文字格保持 alpha = 0。
+// 的像素才参与识别与绘制，中央动态窗口保持 alpha = 0。运行时有编码的
+// 文字由字形管线重画，文字区可以是原版色平涂（不要烘焙字）。
 // 目录里有多少对就加载多少张，互不干扰；同名只取先扫描到的。
 struct SceneFolderSpec {
 	const char* name;
@@ -8793,22 +8837,20 @@ struct SceneFolderSpec {
 	int width;
 	int height;
 	bool masked;
-	// 命中后是否让字形管线让位（仅对 masked 的整屏图有意义）。
-	bool text_yield;
 	// true = 只作场景识别基准，不绘制（允许没有同名高清图）。
 	bool recognize_only;
 };
 
 constexpr SceneFolderSpec SceneFolders[] = {
         {"SCENES", ShopPictureX, ShopPictureY,
-         ShopPictureWidth, ShopPictureHeight, false, false, false},
+         ShopPictureWidth, ShopPictureHeight, false, false},
         {"FRAMES", FramePictureX, FramePictureY,
-         FramePictureWidth, FramePictureHeight, true, true, false},
+         FramePictureWidth, FramePictureHeight, true, false},
         // 新游戏选人界面底图（GRAPH2 记录 1）：整屏 640x400，落在 (0,40)。
         // 6 个头像框由游戏在底图之后画，高清图里对应的黑框会被逐格比对
-        // 自动跳过；底图上没有运行时文字，所以文字不让位。
+        // 自动跳过。
         {"NEWGAME", FramePictureX, FramePictureY,
-         FramePictureWidth, FramePictureHeight, true, false, false},
+         FramePictureWidth, FramePictureHeight, true, false},
 };
 
 void preload_scene_pictures()
@@ -8866,7 +8908,6 @@ void preload_scene_pictures()
 			art.width      = folder.width;
 			art.height     = folder.height;
 			art.masked     = folder.masked;
-			art.text_yield = folder.text_yield;
 			art.recognize_only = folder.recognize_only;
 			const auto low_path  = (dir / name).string();
 			const auto high_path =
@@ -9195,20 +9236,21 @@ void draw_scene_picture(const ScenePictureArt& art, const uint32_t* source,
 			}
 		}
 	}
+	// 这张内景已经画上去了：记下来，别让覆盖它的窗口矩形把它恢复成 4x。
+	mark_hd_art(art.x, art.y, art.width, art.height);
 }
 
 // ---------------------------------------------------------------
 // 整屏界面（FRAMES 目录）：航海 / 港口等 640x400 界面框的高清替换。
 //
 // 与内景不同，整屏画面颜色远超 16 色，调色板分组识别不适用。改用 HD 图的
-// alpha 通道当掩码：alpha >= 50% 的低清格才是“这张图负责的区域”（边框、
-// 面板、装饰）；中央动态窗口与文字格保持 alpha = 0，完全交给游戏原样。
+// alpha 通道当掩码：alpha >= 50% 的低清格才是"这张图负责的区域"（边框、
+// 面板、装饰）；中央动态窗口保持 alpha = 0，完全交给游戏原样。
 //
-// 识别：掩码格里当前帧与低清参考一致的比率 >= FramePictureMinMatchPercent
-// 就认为当前画面就是这张界面（别的界面 / 黑屏 / 淡入淡出都不会命中）。
-// 识别通过后逐格绘制：格子仍与参考一致才写高清，被指针、对话框、动态内容
-// 盖住的格子保持游戏原样——所以开对话框时四周的边框照常高清，对话框压住
-// 的区域不受影响；淡入淡出期间比率不够、什么都不画。
+// 不再逐帧识别"这是哪张界面"：场景由 classify_scene() 定案，定案后直接画
+// 当前场景那一张。每帧只做两件事：第一遍拟合"参考色 → 当前色"的整体亮度
+// 变换（淡入时整份调色板一起压暗，高清图要跟着压）；第二遍逐格用预测色核对，
+// 对不上说明被菜单高亮、对话框或指针盖住，那一格保持游戏原样。
 // ---------------------------------------------------------------
 void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
                         const int source_width, uint32_t* destination,
@@ -9217,55 +9259,15 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 	if (source_width != VgaWidth || art.cell_opaque.empty()) {
 		return;
 	}
+	// 只作识别基准的参考图不参与绘制。
+	if (art.recognize_only) {
+		return;
+	}
 
-	const int width       = art.width;
-	const int height      = art.height;
-	const auto row_at     = [&](const int y) {
+	const int width   = art.width;
+	const int height  = art.height;
+	const auto row_at = [&](const int y) {
         return source + static_cast<size_t>(art.y + y) * source_width + art.x;
-	};
-	// 颜色不参与识别：实机调色板与素材解码用的调色板存在整体偏移，淡入淡出、
-	// 昼夜配色还会再改一遍颜色，按 RGB 比对永远对不上。这里改用"颜色对应表"：
-	// 同一张画面里某个参考色总是稳定落在同一批格子上，按多数票就能把参考调色板
-	// 映射到实机当前调色板；映射只反映"哪个颜色出现在哪里"，属于结构信息。
-	constexpr size_t VoteSlots = 65536;  // 2 的幂
-	struct VoteEntry {
-		uint32_t ref    = 0;
-		uint32_t screen = 0;
-		uint32_t count  = 0;
-	};
-	static std::vector<VoteEntry> votes(VoteSlots);
-	static std::vector<VoteEntry> resolve(VoteSlots);
-	std::fill(votes.begin(), votes.end(), VoteEntry{});
-
-	// 以 (参考色, 实机色) 为键的投票槽，冲突时往后挪一格，几格都占就丢弃。
-	const auto vote_once = [](const uint32_t ref, const uint32_t screen) {
-		auto index = static_cast<size_t>((ref * 2654435761u) ^
-		                                (screen * 2246822519u)) &
-		             (VoteSlots - 1);
-		for (int tries = 0; tries < 3; ++tries) {
-			auto& entry = votes[index];
-			if (entry.count == 0 ||
-			    (entry.ref == ref && entry.screen == screen)) {
-				entry.ref    = ref;
-				entry.screen = screen;
-				++entry.count;
-				return;
-			}
-			index = (index + 1) & (VoteSlots - 1);
-		}
-	};
-	// 以参考色为键的槽，用来取该参考色的胜出实机色。
-	const auto find_ref = [](std::vector<VoteEntry>& table,
-	                         const uint32_t ref) -> VoteEntry* {
-		auto index = static_cast<size_t>(ref * 2654435761u) & (VoteSlots - 1);
-		for (int tries = 0; tries < 2; ++tries) {
-			auto& entry = table[index];
-			if (entry.count == 0 || entry.ref == ref) {
-				return &entry;
-			}
-			index = (index + 1) & (VoteSlots - 1);
-		}
-		return nullptr;
 	};
 	const auto luma_of = [](const uint32_t c) {
 		return (c >> 16 & 0xff) * 299u + (c >> 8 & 0xff) * 587u +
@@ -9273,9 +9275,8 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 	};
 
 	// 游戏内窗口（对话框、面板）的矩形来自 VGA 写追踪，见 window_rects：
-	// 那是"游戏自己写了哪块显存"的直接证据，与颜色无关。必须排除整块矩形，
-	// 而不只是里面的纯色纸面 —— 边框、标题、按钮留在投票里，会以"地图参考色
-	// → 边框色"的票数抢走某个常见色的映射，露出的地图反而认不出来。
+	// 那是"游戏自己写了哪块显存"的直接证据，与颜色无关。整块矩形直接排除，
+	// 那里的界面被压住了，画高清只会把对话框糊掉。
 	static std::vector<uint8_t> window_mask;
 	window_mask.assign(static_cast<size_t>(width) * height, 0);
 	const auto mask_rect = [&](const int x0, const int y0, const int x1,
@@ -9298,14 +9299,21 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		if (window.lost_frames != 0) {
 			continue;
 		}
+		// 比最近一次整屏框体重绘更早的写入，已经被那次重绘覆盖。
+		if (frame_base_known && window.order <= frame_base_order) {
+			continue;
+		}
 		mask_rect(window.x - art.x, window.y - art.y,
 		          window.x - art.x + window.width,
 		          window.y - art.y + window.height);
 	}
-	// 还没满登记年龄的候选也先排除，否则窗口刚画出来的那几帧仍会污染投票。
+	// 还没满登记年龄的候选也先排除，否则窗口刚画出来的那几帧会被当成界面。
 	// 整屏重绘同样会形成候选，那不是窗口，按登记时的尺寸上限挡掉。
 	for (const auto& candidate : window_candidates) {
 		if (!candidate.used) {
+			continue;
+		}
+		if (frame_base_known && candidate.order <= frame_base_order) {
 			continue;
 		}
 		const int cw = candidate.x1 - candidate.x0 + 1;
@@ -9317,235 +9325,67 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		mask_rect(candidate.x0 - art.x, candidate.y0 - art.y,
 		          candidate.x1 + 1 - art.x, candidate.y1 + 1 - art.y);
 	}
-	const auto has_window_mask =
-	        std::find(window_mask.begin(), window_mask.end(),
-	                  static_cast<uint8_t>(1)) != window_mask.end();
 
-	// 先找出被对话框 / 面板盖住的格子，后面的投票与识别都跳过它们。
-	// 判据只比结构：屏幕上一片同色、参考图在同样的位置却不是一个颜色，说明
-	// 这里被整片纯色的面板压住了。地图自己的平整色块在参考图里同样平整，
-	// 不会被误判。
-	static std::vector<uint8_t> panel;
-	panel.assign(static_cast<size_t>(width) * height, 0);
-	// 屏幕上是不是一片同色（不看参考图），用来把面板的边界补全。
-	static std::vector<uint8_t> flat_screen;
-	flat_screen.assign(static_cast<size_t>(width) * height, 0);
-	{
-		const auto ref_at = [&](const int x, const int y) {
-			return art.low[static_cast<size_t>(y) * width + x] & 0x00ffffffu;
-		};
-		const auto screen_at = [&](const int x, const int y) {
-			return row_at(y)[x] & 0x00ffffffu;
-		};
-		for (int y = 0; y < height; ++y) {
-			for (int x = 0; x < width; ++x) {
-				const auto index = static_cast<size_t>(y) * width + x;
-				if (x == 0 || y == 0 || x + 1 >= width || y + 1 >= height) {
-					continue;
-				}
-				const auto screen = screen_at(x, y);
-				const auto ref    = ref_at(x, y);
-				auto flat         = true;
-				auto same_ref     = true;
-				for (int dy = -1; dy <= 1 && (flat || same_ref); ++dy) {
-					for (int dx = -1; dx <= 1; ++dx) {
-						if (dx == 0 && dy == 0) {
-							continue;
-						}
-						if (flat && screen_at(x + dx, y + dy) != screen) {
-							flat = false;
-						}
-						if (same_ref && ref_at(x + dx, y + dy) != ref) {
-							same_ref = false;
-						}
-					}
-				}
-				flat_screen[index] = flat ? 1 : 0;
-				if (flat && !same_ref) {
-					panel[index] = 1;
-				}
-			}
-		}
-	}
-	// 面板里也可能有参考图本来就平整的地方（没被上面的判据抓到）。整片纯色
-	// 的屏幕区域如果紧挨着已认定的面板，就一并向里扩，把面板补成完整的一块。
-	for (int pass = 0; pass < 8; ++pass) {
-		auto changed = false;
-		for (int y = 0; y < height; ++y) {
-			for (int x = 0; x < width; ++x) {
-				const auto index = static_cast<size_t>(y) * width + x;
-				if (panel[index] != 0 || flat_screen[index] == 0) {
-					continue;
-				}
-				if ((x > 0 && panel[index - 1] != 0) ||
-				    (x + 1 < width && panel[index + 1] != 0) ||
-				    (y > 0 && panel[index - width] != 0) ||
-				    (y + 1 < height && panel[index + width] != 0)) {
-					panel[index] = 1;
-					changed      = true;
-				}
-			}
-		}
-		if (!changed) {
-			break;
-		}
-	}
-
-	// 有窗口矩形可依据时只信它：启发式判据会把"屏幕平整、参考图有纹理"的
-	// 海面、渐变也当成面板，对话框之外露出的地图于是被排除、掉回低清。
-	// 一个窗口都没登记到时才退回启发式。
-	if (has_window_mask) {
-		panel = window_mask;
-	}
-
-	// 第一遍：只统计 HD 图占多数不透明、且没被面板盖住的格子，给参考色投票。
+	// 第一遍：对没被窗口遮住的不透明格拟合"参考色 → 当前色"的整体亮度变换。
+	// 淡入是把整份调色板一起压暗，逐通道 gain/offset 就能吸收；这既是高清图
+	// 要跟着压的增益，也是下面逐格核对的预测依据。与内景共用 solve_fit。
+	FitSums sums         = {};
 	int covered          = 0;
 	uint64_t screen_luma = 0;
-	uint64_t ref_sum[3]    = {};
-	uint64_t screen_sum[3] = {};
 	for (int y = 0; y < height; ++y) {
 		const auto* srow = row_at(y);
 		const auto* crow = art.cell_opaque.data() +
 		                   static_cast<size_t>(y) * width;
+		const auto* lrow = art.low.data() + static_cast<size_t>(y) * width;
 		for (int x = 0; x < width; ++x) {
 			const auto index = static_cast<size_t>(y) * width + x;
-			if (crow[x] < HdScale * HdScale / 2 || panel[index] != 0) {
+			if (crow[x] < HdScale * HdScale / 2 || window_mask[index] != 0) {
 				continue;
 			}
-			++covered;
 			const auto color = srow[x] & 0x00ffffffu;
-			const auto ref   = art.low[index] & 0x00ffffffu;
-			vote_once(ref, color);
-			screen_luma += luma_of(color);
+			const auto ref   = lrow[x] & 0x00ffffffu;
 			for (auto channel = 0; channel < 3; ++channel) {
-				const auto shift = channel * 8;
-				ref_sum[channel] += (ref >> shift) & 0xff;
-				screen_sum[channel] += (color >> shift) & 0xff;
+				const auto shift   = channel * 8;
+				const auto stored  = (ref >> shift) & 0xff;
+				const auto actual  = (color >> shift) & 0xff;
+				sums.stored[channel] += stored;
+				sums.actual[channel] += actual;
+				sums.stored_sq[channel] +=
+				        static_cast<uint64_t>(stored) * stored;
+				sums.stored_act[channel] +=
+				        static_cast<uint64_t>(stored) * actual;
 			}
+			++sums.samples;
+			screen_luma += luma_of(color);
+			++covered;
 		}
 	}
 
-	// 归并投票：每个参考色只保留票数最多的实机色。
-	std::fill(resolve.begin(), resolve.end(), VoteEntry{});
-	for (const auto& vote : votes) {
-		if (vote.count == 0) {
-			continue;
-		}
-		if (auto* slot = find_ref(resolve, vote.ref)) {
-			if (vote.count > slot->count) {
-				*slot = vote;
-			}
-		}
-	}
-
-	// 第二遍：按对应表判断每个掩码格是否仍是这张图，并记下来给绘制用。
-	// 被面板盖住的格子直接排除：那里本来就不是地图，画高清只会穿透。
-	static std::vector<uint8_t> cell_match;
-	cell_match.assign(static_cast<size_t>(width) * height, 0);
-	for (int y = 0; y < height; ++y) {
-		const auto* srow = row_at(y);
-		const auto* crow = art.cell_opaque.data() +
-		                   static_cast<size_t>(y) * width;
-		for (int x = 0; x < width; ++x) {
-			const auto index = static_cast<size_t>(y) * width + x;
-			if (crow[x] < HdScale * HdScale / 2 || panel[index] != 0) {
-				continue;
-			}
-			const auto color = srow[x] & 0x00ffffffu;
-			const auto ref   = art.low[index] & 0x00ffffffu;
-			const auto* slot = find_ref(resolve, ref);
-			if (slot == nullptr || slot->count < 2 ||
-			    slot->screen != color) {
-				continue;
-			}
-			cell_match[index] = 1;
-		}
-	}
-
-	// 邻域校验：孤立的一格"碰巧同色"不算数，四邻里至少两格也属于这张图才
-	// 保留。对话框、面板里与地图同色的零散像素不会再被成片替换（穿透）。
-	int matched = 0;
-	for (int y = 0; y < height; ++y) {
-		for (int x = 0; x < width; ++x) {
-			const auto index = static_cast<size_t>(y) * width + x;
-			if (cell_match[index] == 0) {
-				continue;
-			}
-			auto neighbours = 0;
-			if (x > 0 && cell_match[index - 1] != 0) {
-				++neighbours;
-			}
-			if (x + 1 < width && cell_match[index + 1] != 0) {
-				++neighbours;
-			}
-			if (y > 0 && cell_match[index - width] != 0) {
-				++neighbours;
-			}
-			if (y + 1 < height && cell_match[index + width] != 0) {
-				++neighbours;
-			}
-			if (neighbours < 2) {
-				cell_match[index] = 0;
-				continue;
-			}
-			++matched;
-		}
-	}
-
-	const auto total = static_cast<int>(width) * height;
-	// 结构对应关系一旦成立就认，不再要求“已经亮到 92%”：淡入只是整块调色板
-	// 变暗，参考色与实机色的对应仍然一一成立，颜色投票本身就是这一帧的增益。
-	// 唯一排除的是接近纯黑的暗帧——那时量化会把不同颜色压成一团。
-	if (covered * 100 < total * FramePictureMinCoverPercent ||
-	    matched * 100 < covered * FramePictureMinMatchPercent ||
+	// 接近纯黑：没有可替换的内容。
+	if (covered == 0 ||
 	    screen_luma < static_cast<uint64_t>(FramePictureDarkLuma) * covered) {
 		return;
 	}
-	// 命中率留给场景识别：暗帧也能用来提前定案。
-	const int frame_match_pct = covered > 0 ? matched * 100 / covered : 0;
-	if (frame_match_pct > frame_picture_match_percent) {
-		frame_picture_match_percent = frame_match_pct;
-	}
 
-	// 识别通过：记下本帧命中的整屏图，字形管线据此让位（见
-	// text_cell_inside_frame_art）。draw_scene_pictures 每帧开头会清掉。
-	frame_picture_active = true;
-	frame_picture_art    = &art;
-	// 只作识别基准的参考图到这里就结束；识别期也只匹配、不绘制。
-	if (art.recognize_only || frame_picture_draw_suppressed) {
-		return;
-	}
-
-	// 淡入增益：直接用第一遍已经累加好的逐通道总和相除，不再额外遍历
-	// 颜色映射表。淡入是整块调色板按比例压暗，所以只需要一个比例。
-	double gain[3] = {1.0, 1.0, 1.0};
-	for (auto channel = 0; channel < 3; ++channel) {
-		if (ref_sum[channel] > 0) {
-			gain[channel] = static_cast<double>(screen_sum[channel]) /
-			                static_cast<double>(ref_sum[channel]);
-		}
-	}
-	// 纯黑没有可替换的内容。
-	if (gain[0] < 0.02 && gain[1] < 0.02 && gain[2] < 0.02) {
-		return;
-	}
-	// 亮度已经接近满值时直接原样拷贝：细微的拟合误差不带到稳态画面上；
-	// 只有明显还在淡入（增益 < 0.9）才跟着压暗。
-	const bool fit_identity =
-	        gain[0] >= 0.9 && gain[1] >= 0.9 && gain[2] >= 0.9;
-	// 每通道预生成 256 项查表，避免逐像素调用 lround。
+	const auto fit = solve_fit(sums);
+	bool fit_identity = true;
 	uint8_t gain_lut[3][256] = {};
 	for (auto channel = 0; channel < 3; ++channel) {
+		if (std::abs(fit[channel].gain - 1.0) > 0.001 ||
+		    std::abs(fit[channel].offset) > 0.5) {
+			fit_identity = false;
+		}
 		for (auto value = 0; value < 256; ++value) {
 			gain_lut[channel][value] = static_cast<uint8_t>(std::clamp(
-			        static_cast<int>(std::lround(gain[channel] * value)), 0,
-			        255));
+			        static_cast<int>(std::lround(
+			                fit[channel].gain * value + fit[channel].offset)),
+			        0, 255));
 		}
 	}
 	const auto modulate = [&gain_lut](const uint32_t pixel) {
 		const auto r = gain_lut[0][pixel & 0xff];
 		const auto g = gain_lut[1][(pixel >> 8) & 0xff];
-		const auto b = gain_lut[2][(pixel >> 16) & 0xff];
+		const auto b = gain_lut[2][pixel >> 16 & 0xff];
 		return (pixel & 0xff000000u) | static_cast<uint32_t>(r) |
 		       (static_cast<uint32_t>(g) << 8) |
 		       (static_cast<uint32_t>(b) << 16);
@@ -9565,13 +9405,129 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		     composite_count);
 	}
 
-	// 第三遍：绘制。仍属于这张图的格子才写高清；HD 像素自身 alpha >= 50%
-	// 才落笔（每像素判定，允许掩码里留出任意形状的镂空）。
+	// 逐矩形判定：这块写入是真的压在框体上的窗口 / 菜单，还是游戏把框体
+	// 同一块区域重画了一遍（换数值、刷新面板）。面板重绘与参考图几乎完全
+	// 一致，菜单 / 对话框会带来大量新像素。只判一次，不逐格决定画不画，
+	// 所以淡入、换调色板、另一块 graph.dat 都不会让整片面板掉回低清。
+	const auto unmask_rect = [&](const int x0, const int y0, const int x1,
+	                             const int y1) {
+		const int cx0 = std::max(0, x0 - WindowOcclusionMargin);
+		const int cy0 = std::max(0, y0 - WindowOcclusionMargin);
+		const int cx1 = std::min(width, x1 + WindowOcclusionMargin);
+		const int cy1 = std::min(height, y1 + WindowOcclusionMargin);
+		if (cx1 <= cx0 || cy1 <= cy0) {
+			return;
+		}
+		for (int y = cy0; y < cy1; ++y) {
+			auto* row = window_mask.data() + static_cast<size_t>(y) * width;
+			std::fill(row + cx0, row + cx1, static_cast<uint8_t>(0));
+		}
+	};
+	const auto rect_is_overlay = [&](const int x0, const int y0, const int x1,
+	                                 const int y1) {
+		int samples  = 0;
+		int mismatch = 0;
+		for (int y = y0; y < y1; y += 2) {
+			const auto* srow = row_at(y);
+			const auto* crow = art.cell_opaque.data() +
+			                   static_cast<size_t>(y) * width;
+			const auto* lrow = art.low.data() +
+			                   static_cast<size_t>(y) * width;
+			for (int x = x0; x < x1; x += 2) {
+				if (crow[x] < HdScale * HdScale / 2) {
+					continue;
+				}
+				++samples;
+				const auto predicted = modulate(lrow[x] & 0x00ffffffu);
+				const auto current   = srow[x] & 0x00ffffffu;
+				int difference = 0;
+				for (auto channel = 0; channel < 3; ++channel) {
+					const auto shift = channel * 8;
+					const auto a =
+					        static_cast<int>((predicted >> shift) & 0xff);
+					const auto b =
+					        static_cast<int>((current >> shift) & 0xff);
+					difference += a > b ? a - b : b - a;
+				}
+				if (difference > FramePicturePixelTolerance) {
+					++mismatch;
+				}
+			}
+		}
+		return samples != 0 &&
+		       mismatch * 100 > samples * WindowRectOccludePercent;
+	};
+
+	window_occludes_valid = true;
+	window_occludes.fill(0);
+	int rect_kept    = 0;
+	int rect_skipped = 0;
+	for (size_t i = 0; i < window_rect_count; ++i) {
+		const auto& window = window_rects[i];
+		if (window.lost_frames != 0 ||
+		    (frame_base_known && window.order <= frame_base_order)) {
+			continue;
+		}
+		const int x0 = std::max(0, window.x - art.x);
+		const int y0 = std::max(0, window.y - art.y);
+		const int x1 = std::min(width, window.x - art.x + window.width);
+		const int y1 = std::min(height, window.y - art.y + window.height);
+		if (x1 <= x0 || y1 <= y0) {
+			continue;
+		}
+		if (rect_is_overlay(x0, y0, x1, y1)) {
+			window_occludes[i] = 1;
+			++rect_kept;
+			continue;
+		}
+		// 其实只是框体自己被重画了那一片：不遮挡，高清照画。
+		unmask_rect(x0, y0, x1, y1);
+		++rect_skipped;
+		if (composite_count % 60 == 0) {
+			diag("RECTKEEP x=%d y=%d w=%d h=%d type=frame frame=%u",
+			     window.x, window.y, window.width, window.height,
+			     static_cast<unsigned>(composite_count));
+		}
+	}
+	for (const auto& candidate : window_candidates) {
+		if (!candidate.used ||
+		    (frame_base_known && candidate.order <= frame_base_order)) {
+			continue;
+		}
+		const int cw = candidate.x1 - candidate.x0 + 1;
+		const int ch = candidate.y1 - candidate.y0 + 1;
+		if (cw * 100 >= VgaWidth * WindowMaxScreenPercent &&
+		    ch * 100 >= VgaHeight * WindowMaxScreenPercent) {
+			continue;
+		}
+		const int x0 = std::max(0, candidate.x0 - art.x);
+		const int y0 = std::max(0, candidate.y0 - art.y);
+		const int x1 = std::min(width, candidate.x1 + 1 - art.x);
+		const int y1 = std::min(height, candidate.y1 + 1 - art.y);
+		if (x1 <= x0 || y1 <= y0) {
+			continue;
+		}
+		if (!rect_is_overlay(x0, y0, x1, y1)) {
+			unmask_rect(x0, y0, x1, y1);
+		}
+	}
+
+	// 第二遍：遮挡已经在上面按矩形定完，这里只剩两道无条件判定——素材 alpha
+	// 与遮挡掩码。画不画高清不再依赖像素颜色，所以同一片面板在任何场景、
+	// 任何淡入阶段的表现都一致。
+	//
+	// 诊断：左右面板分别统计"要画的格 / 真正画上的格 / 被矩形挡掉的格"。
+	struct CellTally {
+		int candidate = 0;
+		int ok        = 0;
+		int window    = 0;
+	};
+	CellTally left_tally = {};
+	CellTally right_tally = {};
 	const int high_stride = width * HdScale;
 	for (int y = 0; y < height; ++y) {
 		const auto* crow = art.cell_opaque.data() +
 		                   static_cast<size_t>(y) * width;
-		const auto* mrow = cell_match.data() + static_cast<size_t>(y) * width;
 		const auto* hrow = art.high.data() +
 		                   static_cast<size_t>(y * HdScale) * high_stride;
 		auto* drow = destination +
@@ -9579,8 +9535,28 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		                     destination_stride +
 		             art.x * HdScale;
 		for (int x = 0; x < width; ++x) {
-			if (crow[x] < HdScale * HdScale / 2 || mrow[x] == 0) {
-				continue;  // 指针 / 对话框 / 动态内容压住的格子，保持游戏原样
+			const auto index = static_cast<size_t>(y) * width + x;
+			if (crow[x] < HdScale * HdScale / 2) {
+				continue;  // 素材本身透明的格子
+			}
+			const int sx = art.x + x;
+			CellTally* tally = nullptr;
+			if (sx < 96) {
+				tally = &left_tally;
+			} else if (sx >= 480) {
+				tally = &right_tally;
+			}
+			if (tally != nullptr) {
+				++tally->candidate;
+			}
+			if (window_mask[index] != 0) {
+				if (tally != nullptr) {
+					++tally->window;
+				}
+				continue;  // 中央动态窗口 / 对话框 / 菜单压住的格子
+			}
+			if (tally != nullptr) {
+				++tally->ok;
 			}
 			const auto* tile = hrow + x * HdScale;
 			auto* block      = drow + x * HdScale;
@@ -9595,6 +9571,57 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 						                  : modulate(src[dx]);
 					}
 				}
+			}
+			// 记下这一格真的画了高清：窗口恢复靠它跳过已换成高清的区域。
+			const int sy = art.y + y;
+			if (sx >= 0 && sx < VgaWidth && sy >= 0 && sy < VgaHeight) {
+				hd_art_mask[static_cast<size_t>(sy) * VgaWidth + sx] = 1;
+			}
+		}
+	}
+	// 面板覆盖率：数值一变就打一行（静态画面不会有新帧，定期打点等于不打），
+// 另外每 60 个合成帧补一行做节拍。
+	if (art.name == "port") {
+		static int logged_key = -1;
+		const int key = (scene_in_building ? 1000000 : 0) +
+		                left_tally.ok * 10 + right_tally.ok +
+		                left_tally.window + right_tally.window * 3;
+		if (key != logged_key || composite_count % 60 == 0) {
+			logged_key = key;
+			diag("PANELCOV building=%d L cand=%d ok=%d win=%d | R cand=%d ok=%d win=%d | windows=%u rects kept=%d skipped=%d frame=%u",
+			     scene_in_building ? 1 : 0, left_tally.candidate,
+			     left_tally.ok, left_tally.window, right_tally.candidate,
+			     right_tally.ok, right_tally.window,
+			     static_cast<unsigned>(window_rect_count), rect_kept,
+			     rect_skipped, static_cast<unsigned>(composite_count));
+		}
+	}
+	// 诊断：把当前整屏存成 PPM，供离线比对参考图，找出建筑内面板到底
+	// 哪里的颜色对不上。港口每 240 帧覆盖写一次，建筑内每 120 帧一次。
+	if (art.name == "port") {
+		const bool want_dump =
+		        scene_in_building ? (composite_count % 120 == 0)
+		                          : (composite_count % 240 == 0);
+		if (want_dump) {
+			const char* path = scene_in_building ? "sea2-hd-frame-building.ppm"
+			                                     : "sea2-hd-frame-port.ppm";
+			if (auto* out = std::fopen(path, "wb")) {
+				std::fprintf(out, "P6\n%d %d\n255\n", width, height);
+				for (int y = 0; y < height; ++y) {
+					const auto* row = row_at(y);
+					for (int x = 0; x < width; ++x) {
+						const auto c = row[x];
+						const uint8_t rgb[3] = {
+						        static_cast<uint8_t>((c >> 16) & 0xff),
+						        static_cast<uint8_t>((c >> 8) & 0xff),
+						        static_cast<uint8_t>(c & 0xff)};
+						std::fwrite(rgb, 1, 3, out);
+					}
+				}
+				std::fclose(out);
+				diag("FRAMEDUMP %s building=%d frame=%u", path,
+				     scene_in_building ? 1 : 0,
+				     static_cast<unsigned>(composite_count));
 			}
 		}
 	}
@@ -9819,40 +9846,6 @@ void draw_ship_pictures(const uint32_t* source, const int source_width,
 	}
 }
 
-// 文字格（内容坐标 x,y 起点，w×h 像素）是否落在本帧命中的整屏图的不透明
-// 区域里：是则该格由 HD 整图负责，字形管线让位，不重画。中央动态窗口在
-// 整图里 alpha=0，落在其中的文字（压在地图上的对话框等）不受影响，照常
-// 走字形高清。
-bool text_cell_inside_frame_art(const int x, const int y, const int w, const int h)
-{
-	if (!frame_picture_active || frame_picture_art == nullptr) {
-		return false;
-	}
-	const auto& art = *frame_picture_art;
-	// 只替换底图的整屏图（NEWGAME）不拦文字：运行时文字仍走高清字形。
-	if (!art.text_yield) {
-		return false;
-	}
-	int opaque = 0;
-	int total  = 0;
-	for (int cy = y; cy < y + h; ++cy) {
-		for (int cx = x; cx < x + w; ++cx) {
-			// 文字格坐标是 640x400 内容坐标；整屏图几何是 640x480 源坐标。
-			const int ax = cx - art.x;
-			const int ay = cy + ContentYOffset - art.y;
-			if (ax < 0 || ay < 0 || ax >= art.width || ay >= art.height) {
-				continue;
-			}
-			++total;
-			if (art.cell_opaque[static_cast<size_t>(ay) * art.width + ax] >=
-			    HdScale * HdScale / 2) {
-				++opaque;
-			}
-		}
-	}
-	return total > 0 && opaque * 2 >= total;
-}
-
 } // namespace
 
 // 主菜单判别：直接读屏幕上的文字格，按 1.PAT 记录翻译成 Unicode，再找
@@ -9945,6 +9938,22 @@ void draw_sea_picture(const uint32_t* source, const int source_width,
 	}
 }
 
+// 建筑里打开人物情报、菜单之类的面板时，面板窗口会整块压住内景那一小块。
+// 这时内景当然认不出来，但人并没有离开建筑；不能把它算成 miss。
+bool window_covers_scene_probe()
+{
+	for (size_t i = 0; i < window_rect_count; ++i) {
+		const auto& window = window_rects[i];
+		if (window.x < SceneProbeX + SceneProbeWidth &&
+		    SceneProbeX < window.x + window.width &&
+		    window.y < SceneProbeY + SceneProbeHeight &&
+		    SceneProbeY < window.y + window.height) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void draw_scene_interior_pictures(const uint32_t* source,
                                   const int source_width,
                                   uint32_t* destination,
@@ -9977,12 +9986,18 @@ void draw_scene_interior_pictures(const uint32_t* source,
 		scene_in_building    = true;
 		interior_miss_frames = 0;
 	} else if (scene_in_building) {
-		++interior_miss_frames;
-		// 建筑里的对话框实测不会遮住内景那一块（对话全程内景一直能命中），
-		// 所以连续几帧认不出内景就是离开了建筑。
-		if (interior_miss_frames >= 3) {
-			scene_in_building    = false;
+		// 面板压在内景上时认不出来是正常的，等人把面板关掉还能重新命中。
+		if (window_covers_scene_probe()) {
 			interior_miss_frames = 0;
+		} else {
+			++interior_miss_frames;
+		}
+		// 露在明面上还连续几帧认不出，才当作离开了建筑；随后再给内景一段
+		// 重新命中的机会，避免一次遮挡/重绘就让建筑内景永久失效。
+		if (interior_miss_frames >= 3) {
+			scene_in_building     = false;
+			interior_miss_frames  = 0;
+			building_probe_frames = SceneBuildingEnterFrames;
 			diag("SEA2HD: SCENE=Port frame=%u since_black=%u (left building)",
 			     static_cast<unsigned>(composite_count),
 			     static_cast<unsigned>(frames_since_black));
@@ -9991,6 +10006,323 @@ void draw_scene_interior_pictures(const uint32_t* source,
 	// 识别期不倒数，从港口定案那一刻起才开始数。
 	if (!scene_in_building && !scene_probe_pending && building_probe_frames > 0) {
 		--building_probe_frames;
+	}
+}
+
+// ---------------------------------------------------------------
+// GRAPH 管线：游戏直接贴出来的整块位图窗口（价格输入的计算器等）。
+//
+// 与内景（SCENES）不同，这类图没有固定落点，同一张图可能在画面不同位置
+// 出现，所以识别分两步：先用上一次命中的位置原地核对；对不上才在整屏范围
+// 按 2 像素步长搜索，搜索时先比较 16 个锚点做快速排除，再逐像素确认。
+//
+// 目录约定：
+//   assets/original/GRAPH/<名字>.png   游戏原始分辨率的基准图（尺寸即图片尺寸）
+//   assets/hd/GRAPH/<名字>.png         4 倍高清图，可带 alpha（alpha<50% 不写）
+// 高清图暂时可以没有：仍然识别并打 GRAPHMATCH 日志，只是不绘制。
+// ---------------------------------------------------------------
+constexpr int GraphMatchTolerance  = 8;   // 单通道允许偏差
+// 整图一致率只作辅助：计算器显示区是玩家实时输入的数字，必然和参考图
+// 不同，真正的判据是 16 个锚点全部命中。
+constexpr int GraphMatchMinPercent = 60;  // 整图逐像素一致率下限
+constexpr int GraphAnchorMin       = 10;  // 16 个锚点至少要命中几个
+constexpr int GraphSearchStep      = 1;   // 落点可能不在偶数列上
+constexpr int GraphSearchInterval  = 4;   // 未命中时每 4 次绘制调用搜一次
+constexpr int GraphLogInterval     = 60;  // 诊断日志的节流间隔
+
+struct GraphArt {
+	std::string name   = {};
+	int width          = 0;
+	int height         = 0;
+	std::vector<uint32_t> low  = {};
+	std::vector<uint32_t> high = {};  // 4x，0xAARRGGBB
+	// 上一次命中的左上角（VGA 帧坐标），-1 表示尚未命中。
+	int x = -1;
+	int y = -1;
+};
+
+std::vector<GraphArt> graph_arts = {};
+bool graph_arts_attempted        = false;
+// 独立的搜索节拍：合成帧号在静态画面上可能长期不动，不能拿它当计时。
+int graph_search_tick            = 0;
+
+void reset_graph_arts()
+{
+	graph_arts.clear();
+	graph_arts_attempted = false;
+}
+
+void preload_graph_arts()
+{
+	if (graph_arts_attempted) {
+		return;
+	}
+	graph_arts_attempted = true;
+
+	const auto dir = assets_original_root / "GRAPH";
+	std::error_code error;
+	if (!std::filesystem::is_directory(dir, error)) {
+		return;
+	}
+	std::vector<std::string> names = {};
+	for (const auto& file : std::filesystem::directory_iterator(dir, error)) {
+		names.push_back(file.path().filename().string());
+	}
+	if (error) {
+		return;
+	}
+	std::sort(names.begin(), names.end());
+
+	constexpr size_t PngSuffixLen = 4;
+	for (const auto& name : names) {
+		if (name.size() <= PngSuffixLen ||
+		    name.compare(name.size() - PngSuffixLen, PngSuffixLen, ".png") != 0) {
+			continue;
+		}
+		const auto low_path = (dir / name).string();
+		auto* loaded        = IMG_Load(low_path.c_str());
+		if (!loaded) {
+			continue;
+		}
+		const int width  = loaded->w;
+		const int height = loaded->h;
+		SDL_FreeSurface(loaded);
+		if (width <= 0 || height <= 0 || width > VgaWidth ||
+		    height > VgaHeight) {
+			continue;
+		}
+		// 640x400 的整屏图由 FRAMES 管线负责，这里只处理整块小窗口，
+		// 顺带省掉一大片无意义的搜索成本。
+		if (width * height * 2 > VgaWidth * VgaHeight) {
+			diag("GRAPHSKIP %s %dx%d fullscreen", name.c_str(), width, height);
+			continue;
+		}
+		GraphArt art   = {};
+		art.name       = name.substr(0, name.size() - PngSuffixLen);
+		art.width      = width;
+		art.height     = height;
+		if (!load_shop_png(low_path, width, height, art.low)) {
+			continue;
+		}
+		const auto high_path = (assets_root / "GRAPH" / name).string();
+		if (std::filesystem::is_regular_file(high_path)) {
+			if (!load_picture_png_rgba(high_path, width * HdScale,
+			                           height * HdScale, art.high)) {
+				LOG_WARNING("SEA2HD: GRAPH picture %s has an unusable HD image",
+				            art.name.c_str());
+				art.high.clear();
+			}
+		}
+		LOG_MSG("SEA2HD: Loaded GRAPH picture %s (%dx%d)%s", art.name.c_str(),
+		        width, height, art.high.empty() ? " [no HD]" : "");
+		graph_arts.push_back(std::move(art));
+	}
+	diag("GRAPHLOAD count=%u", static_cast<unsigned>(graph_arts.size()));
+}
+
+bool graph_pixel_close(const uint32_t a, const uint32_t b)
+{
+	for (auto channel = 0; channel < 3; ++channel) {
+		const auto shift = channel * 8;
+		const auto x     = static_cast<int>((a >> shift) & 0xff);
+		const auto y     = static_cast<int>((b >> shift) & 0xff);
+		if (std::abs(x - y) > GraphMatchTolerance) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// 16 个锚点里命中几个。搜索时先用它给每个落点打分，只有得分最高的位置
+// 才做逐像素确认，比“每个位置都逐像素比”便宜两个数量级。
+int graph_anchor_hits(const GraphArt& art, const uint32_t* source,
+                      const int source_width, const int ox, const int oy)
+{
+	int hits = 0;
+	for (int gy = 0; gy < 4; ++gy) {
+		for (int gx = 0; gx < 4; ++gx) {
+			const int rx = art.width * (gx * 2 + 1) / 8;
+			const int ry = art.height * (gy * 2 + 1) / 8;
+			const auto* srow =
+			        source + static_cast<size_t>(oy + ry) * source_width + ox;
+			if (graph_pixel_close(
+			            srow[rx],
+			            art.low[static_cast<size_t>(ry) * art.width + rx])) {
+				++hits;
+			}
+		}
+	}
+	return hits;
+}
+
+// 参考图左上角落在 (ox, oy) 时，当前画面是否仍是这张图。
+int graph_match_percent(const GraphArt& art, const uint32_t* source,
+                        const int source_width, const int ox, const int oy)
+{
+	// 锚点：把参考图均分成 4x4 块，各取中心。先用 16 个点快速排除。
+	if (graph_anchor_hits(art, source, source_width, ox, oy) < GraphAnchorMin) {
+		return 0;
+	}
+
+	int good = 0;
+	for (int y = 0; y < art.height; ++y) {
+		const auto* srow = source + static_cast<size_t>(oy + y) * source_width + ox;
+		const auto* lrow = art.low.data() + static_cast<size_t>(y) * art.width;
+		for (int x = 0; x < art.width; ++x) {
+			if (graph_pixel_close(srow[x], lrow[x])) {
+				++good;
+			}
+		}
+	}
+	return good * 100 / (art.width * art.height);
+}
+
+// 窗口（对话框等）压在这块上面时不画高清，交给游戏原样显示。
+bool graph_covered_by_window(const int x, const int y, const int width,
+                             const int height)
+{
+	for (size_t i = 0; i < window_rect_count; ++i) {
+		const auto& window = window_rects[i];
+		if (window.lost_frames != 0) {
+			continue;
+		}
+		if (x < window.x + window.width && window.x < x + width &&
+		    y < window.y + window.height && window.y < y + height) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void draw_graph_pictures(const uint32_t* source, const int source_width,
+                         uint32_t* destination, const int destination_stride)
+{
+	if (source_width != VgaWidth) {
+		return;
+	}
+	preload_graph_arts();
+	if (graph_arts.empty()) {
+		return;
+	}
+
+	++graph_search_tick;
+	const bool search_now = (graph_search_tick % GraphSearchInterval) == 0;
+
+	for (auto& art : graph_arts) {
+		bool matched = false;
+		if (art.x >= 0 && art.y >= 0 && art.x + art.width <= VgaWidth &&
+		    art.y + art.height <= VgaHeight &&
+		    graph_match_percent(art, source, source_width, art.x, art.y) >=
+		            GraphMatchMinPercent) {
+			matched = true;
+		} else {
+			art.x = -1;
+			art.y = -1;
+			// 全屏搜索比较费，未命中时按固定节拍做；命中之后只在该位置
+			// 原地核对，几乎不花时间。
+			if (!search_now) {
+				continue;
+			}
+			const int max_x = VgaWidth - art.width;
+			const int max_y = VgaHeight - art.height;
+			int best_hits   = 0;
+			int best_x      = 0;
+			int best_y      = 0;
+			for (int oy = 0; oy <= max_y; oy += GraphSearchStep) {
+				for (int ox = 0; ox <= max_x; ox += GraphSearchStep) {
+					const auto hits = graph_anchor_hits(art, source,
+					                                    source_width, ox, oy);
+					if (hits > best_hits) {
+						best_hits = hits;
+						best_x    = ox;
+						best_y    = oy;
+						if (best_hits == 16) {
+							break;
+						}
+					}
+				}
+				if (best_hits == 16) {
+					break;
+				}
+			}
+			int percent = 0;
+			if (best_hits >= GraphAnchorMin) {
+				percent = graph_match_percent(art, source, source_width,
+				                              best_x, best_y);
+			}
+			// 锚点全中才算认出来；一致率只用来拦住“形状对、内容完全不同”
+			// 的极端情况（例如同一位置画了另一张图）。
+			if (best_hits == 16 && percent >= GraphMatchMinPercent) {
+				art.x   = best_x;
+				art.y   = best_y;
+				matched = true;
+				diag("GRAPHMATCH %s x=%d y=%d frame=%u", art.name.c_str(),
+				     art.x, art.y, static_cast<unsigned>(composite_count));
+			} else if (best_hits >= 8 &&
+			           graph_search_tick % GraphLogInterval == 0) {
+				// 锚点命中不少但整图对不上：位置大概对了，差异在颜色或
+				// 局部内容（比如计算器显示区里的实时数字）。
+				diag("GRAPHSCAN %s best=%d x=%d y=%d pct=%d frame=%u",
+				     art.name.c_str(), best_hits, best_x, best_y, percent,
+				     static_cast<unsigned>(composite_count));
+			}
+		}
+		if (!matched) {
+			continue;
+		}
+		if (graph_covered_by_window(art.x, art.y, art.width, art.height)) {
+			if (graph_search_tick % GraphLogInterval == 0) {
+				diag("GRAPHCOVER %s x=%d y=%d frame=%u", art.name.c_str(),
+				     art.x, art.y, static_cast<unsigned>(composite_count));
+			}
+			continue;
+		}
+		if (art.high.empty()) {
+			// 还没有高清图：把这块从底层高清面板手里收回来，按 4 倍最近
+			// 邻还原游戏原像素，否则面板高清会整块盖住这个窗口。
+			for (int y = 0; y < art.height; ++y) {
+				const auto* srow =
+				        source + static_cast<size_t>(art.y + y) * source_width +
+				        art.x;
+				auto* drow = destination +
+				             static_cast<size_t>(art.y + y) * HdScale *
+				                     destination_stride +
+				             art.x * HdScale;
+				for (int dy = 0; dy < HdScale; ++dy) {
+					auto* out = drow +
+					            static_cast<size_t>(dy) * destination_stride;
+					for (int x = 0; x < art.width; ++x) {
+						const auto pixel = srow[x] & 0x00ffffffu;
+						for (int dx = 0; dx < HdScale; ++dx) {
+							out[x * HdScale + dx] = pixel;
+						}
+					}
+				}
+			}
+			continue;
+		}
+
+		const int high_stride = art.width * HdScale;
+		for (int y = 0; y < art.height; ++y) {
+			const auto* hrow =
+			        art.high.data() +
+			        static_cast<size_t>(y * HdScale) * high_stride;
+			auto* drow = destination +
+			             static_cast<size_t>(art.y + y) * HdScale *
+			                     destination_stride +
+			             art.x * HdScale;
+			for (int dy = 0; dy < HdScale; ++dy) {
+				const auto* src = hrow + static_cast<size_t>(dy) * high_stride;
+				auto* out       = drow +
+				                  static_cast<size_t>(dy) * destination_stride;
+				for (int dx = 0; dx < high_stride; ++dx) {
+					if ((src[dx] >> 24) >= 128) {
+						out[dx] = src[dx] & 0x00ffffffu;
+					}
+				}
+			}
+		}
+		mark_hd_art(art.x, art.y, art.width, art.height);
 	}
 }
 
@@ -10004,13 +10336,9 @@ void draw_scene_pictures(const uint32_t* source, const int source_width,
 		return;
 	}
 	preload_scene_pictures();
-	// 每帧重新判定：整屏图是否命中、命中哪张。字形管线在后面的合成阶段
-	// 依据它决定让不让位。
-	frame_picture_active = false;
-	frame_picture_art    = nullptr;
-	scene_picture_art    = nullptr;
-	frame_picture_match_percent = 0;
-	frame_picture_draw_suppressed = false;
+	// 每帧重新判定：内景命中哪张。
+	scene_picture_art = nullptr;
+
 
 
 	// 主菜单已经能由文字独立确认：不再做任何整屏图匹配。菜单文字本身
@@ -10019,35 +10347,25 @@ void draw_scene_pictures(const uint32_t* source, const int source_width,
 		return;
 	}
 
-	// 识别期（刚换场景）只做匹配、不绘制：此刻还不知道是哪个场景，
-	// 一旦某张参考图在"长得像"的界面上命中（例如读档界面与新游戏共用
-	// 背景），就会把错误的高清图画上去。
-	const bool run_all =
-	        !sea2_scene_gate_enabled || scene_gate_detect_phase();
-	frame_picture_draw_suppressed =
-	        sea2_scene_gate_enabled && scene_gate_detect_phase();
-	if (run_all) {
-		// 顺序与原实现一致：内景 → 港口 → 海上 → 新游戏。
+	// 识别期（刚换场景）：只跑内景识别，它是"建筑内"状态的唯一来源；整屏框
+	// 一张都不画。classify_scene() 靠日期 / 六框判定，两帧就定案，空窗期
+	// 不会比原来的全图投票更长。
+	if (scene_gate_detect_phase() || sea2_scene == Sea2Scene::Unknown) {
 		draw_scene_interior_pictures(source, source_width, destination,
 		                             destination_stride);
-		draw_port_picture(source, source_width, destination,
-		                  destination_stride);
-		draw_sea_picture(source, source_width, destination,
-		                 destination_stride);
-		draw_newgame_picture(source, source_width, destination,
-		                     destination_stride);
 	} else {
 		switch (sea2_scene) {
 		case Sea2Scene::Port:
-			// 港口和建筑内跑的不是同一条管线：港口只画港口框，建筑内只画
-			// 内景。建筑内认不出内景时什么都不画（多半只是开了对话框），
-			// 不会把港口框叠进去。
+			// 建筑内是港口的子状态：先内景，再港口框。港口图中央窗口
+			// alpha=0，不会遮住内景。
 			draw_scene_interior_pictures(source, source_width, destination,
 			                             destination_stride);
-			if (!scene_in_building) {
-				draw_port_picture(source, source_width, destination,
-				                  destination_stride);
-			}
+			draw_port_picture(source, source_width, destination,
+			                  destination_stride);
+			// 港口的子场景（建筑内）会出现计算器这类整块位图窗口，画在
+			// 框体高清之上；它压住哪块就哪块换成高清。
+			draw_graph_pictures(source, source_width, destination,
+			                    destination_stride);
 			break;
 		case Sea2Scene::Sailing:
 			draw_sea_picture(source, source_width, destination,
@@ -10325,6 +10643,11 @@ void drop_scene_text_state()
 	}
 	vga_write_planes.fill(0);
 	vga_write_dirty = false;
+	// 新场景没有旧画面的绘制次序概念，遮挡判定全部从头开始。
+	frame_base_order     = 0;
+	frame_base_known     = false;
+	window_occludes_valid = false;
+	window_occludes.fill(0);
 }
 
 // 淡出到一半时粗网格的平均亮度就已经很低，可屏幕上还留着没暗完的内容。那时
@@ -10573,14 +10896,16 @@ void window_extract_write_rects()
 	};
 	std::array<Span, 32> open = {};
 	size_t open_count = 0;
+	int extracted     = 0;
 
-	const auto close_span = [](const Span& span) {
+	const auto close_span = [&](const Span& span) {
 		const int px0 = span.x0 * 8;
 		const int px1 = (span.x1 + 1) * 8 - 1;
 		const int py0 = span.y0;
 		const int py1 = span.y1;
 		if (px1 - px0 + 1 >= WindowMinWidthPx &&
 		    py1 - py0 + 1 >= WindowMinHeightPx) {
+			++extracted;
 			window_merge_candidate(px0, py0, px1, py1);
 		}
 	};
@@ -10638,6 +10963,14 @@ void window_extract_write_rects()
 	}
 	for (size_t i = 0; i < open_count; ++i) {
 		close_span(open[i]);
+	}
+	// 一批写入切出了几个矩形。侧边菜单 / 建筑菜单如果这里就是 0，说明它的
+	// 写入没有形成"连续整行填充"，窗口识别根本无从谈起。
+	static int logged_extracted = -1;
+	if (extracted != logged_extracted) {
+		logged_extracted = extracted;
+		diag("WINRECTS rects=%d frame=%u", extracted,
+		     static_cast<unsigned>(composite_count));
 	}
 }
 
@@ -10713,6 +11046,24 @@ void window_finalize_candidate(const WindowCandidate& candidate,
 	}
 	if (width * 100 >= source_width * WindowMaxScreenPercent &&
 	    height * 100 >= source_height * WindowMaxScreenPercent) {
+		// 这一批写入就是整屏框体重绘（港口 / 航海 / 建筑进入时都会这样刷
+		// 一遍）。它不是窗口，而是新的画面基准：框体照常无条件换高清，只
+		// 把比它更早登记、已经被这次重绘覆盖掉的窗口作废。
+		frame_base_order = std::max(frame_base_order, candidate.order);
+		frame_base_known = true;
+		size_t kept = 0;
+		for (size_t i = 0; i < window_rect_count; ++i) {
+			if (window_rects[i].order > frame_base_order) {
+				window_rects[kept++] = window_rects[i];
+			}
+		}
+		if (kept != window_rect_count) {
+			diag("FRAMEBASE order=%u dropped=%u frame=%u",
+			     static_cast<unsigned>(frame_base_order),
+			     static_cast<unsigned>(window_rect_count - kept),
+			     static_cast<unsigned>(composite_count));
+		}
+		window_rect_count = kept;
 		return;
 	}
 
@@ -10733,6 +11084,10 @@ void window_finalize_candidate(const WindowCandidate& candidate,
 	        (weakest_side >= WindowRingSideMinPercent ||
 	         ring_percent >= WindowRingStrongPercent);
 	if (paper_percent < WindowPaperMinPercent || !strong_ring) {
+		diag("WINREJ x=%d y=%d w=%d h=%d why=%s inside=%d%% ring=%d%% weak=%d%% frame=%u",
+		     x, y, width, height,
+		     paper_percent < WindowPaperMinPercent ? "paper" : "ring",
+		     paper_percent, ring_percent, weakest_side, composite_count);
 		return;
 	}
 	window_register(x, y, width, height, paper, candidate.order, source,
@@ -10850,6 +11205,41 @@ void window_update(const uint32_t* source, const int source_width,
 	if (!screen_fading) {
 		window_verify(source, source_width, source_height);
 	}
+
+	// 窗口集合（含次序与"已判死"标记）一变就打一份快照。静态画面时合成帧
+	// 不再增长，只有事件驱动的日志才能对上人眼看到的那一刻。
+	uint64_t hash = 1469598103934665603ull;
+	const auto mix = [&hash](const uint64_t value) {
+		hash ^= value;
+		hash *= 1099511628211ull;
+	};
+	mix(frame_base_order);
+	mix(window_rect_count);
+	for (size_t i = 0; i < window_rect_count; ++i) {
+		const auto& w = window_rects[i];
+		mix(static_cast<uint64_t>(w.x) << 40 | static_cast<uint64_t>(w.y) << 28 |
+		    static_cast<uint64_t>(w.width) << 16 |
+		    static_cast<uint64_t>(w.height));
+		mix(w.order);
+		mix(w.lost_frames);
+	}
+	static uint64_t logged_window_hash = 0;
+	if (hash != logged_window_hash) {
+		logged_window_hash = hash;
+		diag("WINSET base=%u n=%u frame=%u",
+		     static_cast<unsigned>(frame_base_order),
+		     static_cast<unsigned>(window_rect_count),
+		     static_cast<unsigned>(composite_count));
+		for (size_t i = 0; i < window_rect_count; ++i) {
+			const auto& w = window_rects[i];
+			diag("WINSET-RECT i=%u x=%d y=%d w=%d h=%d order=%u lost=%u paper=%06X frame=%u",
+			     static_cast<unsigned>(i), w.x, w.y, w.width, w.height,
+			     static_cast<unsigned>(w.order),
+			     static_cast<unsigned>(w.lost_frames),
+			     static_cast<unsigned>(w.paper),
+			     static_cast<unsigned>(composite_count));
+		}
+	}
 }
 
 // 把所有窗口矩形内的像素恢复成游戏的 4x 原始像素。这一步放在所有 HD 图形
@@ -10857,12 +11247,27 @@ void window_update(const uint32_t* source, const int source_width,
 //   - 窗口盖住的 HD 图形被整体撤掉，不会透出来；
 //   - 窗口内后画的文字仍然走正常的高清替换；
 //   - 被新窗口部分遮住时，只有被遮住的那块恢复，露出的部分照常高清。
+//
+// 例外：窗口矩形是"游戏先铺的那块底"，里面常常还画着之后才画上去的立绘 /
+// 建筑内景（窗口其实在它们下面）。这些位置由 hd_art_mask 标出来，跳过恢复，
+// 否则立绘会被窗口矩形整块改回 4x 原始像素。
 void window_restore_pixels(const uint32_t* source, const int source_width,
                            const int source_height, uint32_t* destination,
                            const int destination_pitch)
 {
+	const bool protect_hd_art =
+	        source_width == VgaWidth && source_height == VgaHeight;
 	for (size_t i = 0; i < window_rect_count; ++i) {
 		const auto& window = window_rects[i];
+		// 比最近一次整屏框体重绘更早的写入已经被覆盖，不必恢复。
+		if (frame_base_known && window.order <= frame_base_order) {
+			continue;
+		}
+		// 本帧判定这块其实只是框体自己重画的一片：高清已经画上去了，
+		// 不能再按窗口恢复成 4 倍原始像素。
+		if (window_occludes_valid && window_occludes[i] == 0) {
+			continue;
+		}
 		const int x0 = std::max(0, window.x);
 		const int y0 = std::max(0, window.y);
 		const int x1 = std::min(source_width, window.x + window.width);
@@ -10870,11 +11275,19 @@ void window_restore_pixels(const uint32_t* source, const int source_width,
 		for (int y = y0; y < y1; ++y) {
 			const uint32_t* src_row =
 			        source + static_cast<size_t>(y) * source_width;
+			const uint8_t* mask_row =
+			        protect_hd_art
+			                ? hd_art_mask.data() +
+			                          static_cast<size_t>(y) * VgaWidth
+			                : nullptr;
 			for (int dy = 0; dy < HdScale; ++dy) {
 				uint32_t* dst_row = destination +
 				        (static_cast<size_t>(y) * HdScale + dy) *
 				                destination_pitch;
 				for (int x = x0; x < x1; ++x) {
+					if (mask_row != nullptr && mask_row[x] != 0) {
+						continue;
+					}
 					const auto color = src_row[x];
 					uint32_t* out = dst_row +
 					        static_cast<size_t>(x) * HdScale;
@@ -10926,6 +11339,9 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 
 	// 建筑内景小画（方案 B）：只在画面确实是那张图时替换成 4 倍平滑版本。
 	if (source_width == VgaWidth && source_height == VgaHeight) {
+		hd_art_mask.fill(0);
+		// 遮挡判定由本帧绘制重新给出；没给出前按"都遮挡"处理（旧行为）。
+		window_occludes_valid = false;
 		draw_scene_pictures(source, source_width, destination,
 		                    destination_stride);
 	}
@@ -11239,19 +11655,18 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				                  blend_channel(r, db, alpha)};
 			}
 		}
+		// 立绘已经画上去了：记下来，窗口矩形恢复像素时不能把这整块改回 4x。
+		mark_hd_art(command.x, command.y + ContentYOffset, Kao64Width,
+		            Kao64Height);
 	}
 
 	// Simplified text glyphs are drawn after the portraits so they always win.
 	// A cell that no longer looks like a glyph is simply skipped this frame;
 	// it is never deleted, so the next redraw brings the text back.
 	// ---------------------------------------------------------------
-	// 【2026-11-16 字形管线让位规则】主界面框（港口/航海）改为 FRAMES 整图
-	// 替换后，落在整屏图不透明区里的繁体文字、加粗标签、符号（功能图标）
-	// 由 HD 整图负责，字形管线不重画（否则会盖掉 HD 图上的文字并留平涂
-	// 补丁）。其余一切照常：数字与 % 永远走字形高清（游戏动态数值），
-	// 对话框、菜单、内景以及压在中央动态窗口上的文字也照常高清。
-	// 判定见 text_cell_inside_frame_art()，命中标记由 draw_frame_picture()
-	// 每帧设置、draw_scene_pictures() 每帧清零。
+	// 【2026-11-19 取消字形让位】整屏图只负责静态美术；运行时有编码的文字
+	// 一律由字形管线重画。原版美术若是烘焙文字，运行时那里根本没有字形
+	// blit，也就不会被登记成文字格；反之被登记的文字格必定该交给高清字形。
 	// ---------------------------------------------------------------
 	if (source_width == VgaWidth && source_height == VgaHeight) {
 		// 先核对上一帧留下的整块美术记录：已经被擦掉的当场作废，之后判断
@@ -11413,6 +11828,12 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				}
 			}
 		}
+		// 诊断：统计这一帧真正画到左右面板上的汉字格，用来确认建筑内
+		// 面板美术字是否是文字管线重画盖掉的。
+		int panel_text_left  = 0;
+		int panel_text_right = 0;
+		unsigned sample_lx = 0, sample_ly = 0, sample_lrec = 0;
+		unsigned sample_rx = 0, sample_ry = 0, sample_rrec = 0;
 		for (auto& cell : text_cells) {
 			uint16_t record     = 0;
 			uint32_t background = 0;
@@ -11508,14 +11929,6 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 			if (identified == 0) {
 				continue;
 			}
-			// 本帧有整屏图命中、且这一格落在 HD 图的不透明区里：该格由
-			// HD 整图负责（文字已画/将画进 HD 图），字形管线让位不重画。
-			// 中央动态窗口与未命中的画面不受影响，照常画高清字形。
-			if (text_cell_inside_frame_art(static_cast<int>(cell.x),
-			                               static_cast<int>(cell.y),
-			                               TextGlyphWidth, TextGlyphHeight)) {
-				continue;
-			}
 			const auto display_record = patched_text_record(cell, record);
 			// 文字一律整格画成高清，然后把不属于文字的像素（对话框、按钮、
 			// 指针）按"这里本该是什么颜色"逐像素原样贴回，面板就压在最上层。
@@ -11523,6 +11936,23 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 			                                  background, ink, destination,
 			                                  destination_stride,
 			                                  static_cast<uint16_t>(0xffffu));
+			if (drawn) {
+				if (cell.x < 96) {
+					if (panel_text_left == 0) {
+						sample_lx   = cell.x;
+						sample_ly   = cell.y;
+						sample_lrec = display_record;
+					}
+					++panel_text_left;
+				} else if (cell.x >= 480) {
+					if (panel_text_right == 0) {
+						sample_rx   = cell.x;
+						sample_ry   = cell.y;
+						sample_rrec = display_record;
+					}
+					++panel_text_right;
+				}
+			}
 			// The tile covers the whole cell, so the pointer has to be put
 			// back on top of it. Only pixels that carry neither the ink nor
 			// the background are touched, so a cell the pointer merely passes
@@ -11543,6 +11973,13 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 				                       cell.stipple ? cell.screen_ink : ink,
 				                       cell.stipple, cell.stipple_phase);
 			}
+		}
+		if (composite_count % 60 == 0) {
+			diag("PANELTEXT building=%d L=%d(%u,%u,%u) R=%d(%u,%u,%u) cells=%u frame=%u",
+			     scene_in_building ? 1 : 0, panel_text_left, sample_lx,
+			     sample_ly, sample_lrec, panel_text_right, sample_rx, sample_ry,
+			     sample_rrec, static_cast<unsigned>(text_cells.size()),
+			     static_cast<unsigned>(composite_count));
 		}
 		// Numerals are a separate path and a separate cell size, so they are
 		// painted last and always win over the Han text around them. A cell
