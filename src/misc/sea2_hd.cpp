@@ -99,6 +99,10 @@ constexpr uint8_t KaoMaxReferenceUpdates = 250;
 // resolution picture.
 constexpr int KaoForeignPixelTolerance = 36;
 
+// 指针盖在立绘上时，像素与锁存时的立绘像素差得这么多，就是箭头本体。
+// 立绘是逐帧不变的静态画面，只有指针会把它改写，所以门槛接近"只要有差别"。
+constexpr int KaoPointerStoredTolerance = 24;
+
 // The brightness is fitted on the pixels that already agree with the fit. A
 // window or a dialog inside the box is not part of that fit, so it can no
 // longer drag the gain and the offset away from the portrait and turn a large
@@ -260,10 +264,45 @@ constexpr std::array<std::pair<uint16_t, uint16_t>, 6> ScenePortraitBoxes = {
         },
 };
 
+// 头像装饰框相对头像实际向外扩的像素：右、下是投影阴影，比左、上多。
+constexpr int PortraitFrameLeft   = 8;
+constexpr int PortraitFrameTop    = 6;
+constexpr int PortraitFrameRight  = 8;
+constexpr int PortraitFrameBottom = 11;
+
 bool is_scene_portrait_box(const DrawCommand& command)
 {
 	for (const auto& box : ScenePortraitBoxes) {
 		if (command.x == box.first && command.y == box.second) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// 角色选择界面的每个头像外面还有一圈装饰边框，右侧和底侧再带一条阴影。
+// 游戏在悬停 / 点击头像时会把这一圈边框重新画一遍，VGA 写追踪于是把
+// "头像 + 边框"当成一扇 80x97 的窗口登记下来；随后的窗口恢复又把高清
+// 底图上这圈边框改回 4 倍原始像素，高清头像外围就多出一圈低清。
+// 这圈边框本来就是底图（graph2）的一部分，不是盖在底图上的窗口，应当
+// 按底图照常高清，绝不能登记成窗口。
+bool rect_is_portrait_frame(const int x, const int y, const int width,
+                            const int height)
+{
+	// 实测外扩：左 8、上 6、右 8、下 11（含阴影），这里留一点余量。
+	constexpr int PortraitFrameMaxMargin = 16;
+	for (const auto& box : ScenePortraitBoxes) {
+		const int left   = box.first - x;
+		const int top    = box.second + ContentYOffset - y;
+		const int right  = x + width - (box.first + Kao64Width);
+		const int bottom = y + height -
+		                   (box.second + ContentYOffset + Kao64Height);
+		if (left < 0 || top < 0 || right < 0 || bottom < 0) {
+			continue;
+		}
+		if (left <= PortraitFrameMaxMargin && top <= PortraitFrameMaxMargin &&
+		    right <= PortraitFrameMaxMargin &&
+		    bottom <= PortraitFrameMaxMargin) {
 			return true;
 		}
 	}
@@ -348,6 +387,15 @@ constexpr int TextPointerMargin = 24;
 constexpr int PointerBoxSlack  = 6;
 constexpr int PointerBoxWidth  = 36;
 constexpr int PointerBoxHeight = 40;
+// 上面那个 40x40 的框是给"跳过指针附近的字形/边框采样"用的，范围必须宽。
+// 叠加绘制不能沿用它：源里的箭头本体只有 16x16，多留 2 像素余量就够，
+// 否则箭头周围一大片低清像素会被 4 倍贴回去，形成块状残像。
+constexpr int PointerDrawSlack  = 2;
+constexpr int PointerDrawWidth  = 20;
+constexpr int PointerDrawHeight = 20;
+// 只有和参考图差得很远的像素才可能是箭头描边。颜色抖动、字体边缘这种
+// 小差异也贴成 4 倍的话，同样会留下一圈残像。
+constexpr int PointerDrawTolerance = 120;
 
 constexpr int GlyphAtlasColumns = 64;
 constexpr int GlyphTileWidth    = TextGlyphWidth * HdScale;
@@ -694,6 +742,8 @@ uint32_t blit_order     = 0;
 void diag(const char* format, ...);
 // GRAPH 管线（计算器这类整块位图窗口）在场景资源重载时要一起清掉。
 void reset_graph_arts();
+// YESNO 管线（是/否选择框）同样在资源重载时清掉。
+void reset_yesno_art();
 
 void cover_rect_sample_point(const CoverRect& rect, const int index, int& x,
                              int& y)
@@ -1614,6 +1664,7 @@ void reset_assets()
 	port_map_panel_ready = false;
 	port_map_drew_last = false;
 	reset_graph_arts();
+	reset_yesno_art();
 }
 
 const Asset* get_kao64_asset(const uint16_t entry)
@@ -5177,6 +5228,11 @@ constexpr int WindowMinWidthPx   = 64;
 constexpr int WindowMinHeightPx  = 48;
 constexpr int WindowMinAreaPx    = WindowMinWidthPx * WindowMinHeightPx;
 constexpr int WindowFillRunBytes = 6;    // 一行至少 48 像素才算填充行
+// 边框行（圆角、内嵌双线、投影）的填充宽度往往比中间的纯填充行窄或宽几个
+// 像素。若要求每行字节范围完全相同，这些行会被丢掉，窗口就缺一条上边或
+// 下边。允许宽度相近、大部分重叠的相邻行接续成同一块。
+constexpr int WindowSpanWidthSlackBytes = 2;   // 相邻行宽度差不超过 16 像素
+constexpr int WindowSpanOverlapPercent  = 50;
 
 constexpr int WindowBorderSamples         = 32;
 constexpr int WindowBorderInset           = 2;
@@ -5187,10 +5243,18 @@ constexpr int WindowRingSideMinPercent    = 25;
 // 只要整体边框足够强，仍然认定它是窗口，否则真正的对话框永远登记不上，
 // "窗口覆盖范围内停画"就无从谈起。
 // 建筑里的固定菜单框（市场商品列表等）也有一面与面板同色，实测整体边框
-// 67%、最弱边 12%，因此整体门限取 60%。误登记的代价已经很小：真正属于框体
-// 自己的重绘会在 rect_is_overlay / RECTKEEP 那一步被撤回。
-constexpr int WindowRingStrongPercent     = 60;
-constexpr int WindowBorderMismatchPercent = 35;
+// 67%、最弱边 12%；右侧信息面板上的贴边窗口实测整体边框 53%、最弱边 0%，
+// 因此整体门限取 50%（不能再高，否则这类窗口永远登记不上，面板高清透进
+// 对话框）。误登记的代价已经很小：真正属于框体自己的重绘会在
+// rect_is_overlay / RECTKEEP 那一步被撤回。
+constexpr int WindowRingStrongPercent     = 50;
+// 边框签名只用来判断"窗口还在不在"。游戏的面板/菜单边框带点阵抖动，指针
+// 高亮或菜单重画会让签名取样点颜色在两种纸色之间翻转，实测右侧菜单稳定在
+// 40%~53% 的不一致；35% 会在窗口仍然开着的时候把它作废（作废后不会再登记，
+// 面板高清就一直透进菜单）。真正的消失（菜单关闭、面板露出来）会让边框
+// 颜色整体改变，不一致接近 100%。因此门槛取 65%，重叠的误判由每帧的
+// rect_is_overlay 撤回。
+constexpr int WindowBorderMismatchPercent = 65;
 constexpr int WindowMinExposedSamples     = 8;
 constexpr int WindowLostFrames            = 2;
 constexpr int WindowCandidateAge          = 4;
@@ -5212,6 +5276,13 @@ bool vga_write_dirty = false;
 // 这一批写入发生时的 blit_order。窗口登记时用它当 order，才能和数字格自己
 // 记录的 order 比较先后：窗口 order 更大 = 窗口画在数字之上。
 uint32_t vga_write_order = 0;
+// 每一批写入（两次合成之间的连续写入）的编号，每批必增。blit_order 只在
+// 真的发生 blit 时才增长，相邻两批之间没有 blit 时 order 完全相同，无法
+// 区分先后；批次号才能准确回答"这块窗口是在整屏框体之后画的吗"。
+uint32_t vga_write_batch = 0;
+// 只按绘制次序比较、不掺批次号。数字/字形记录里没有批次号，用这个值表示
+// "不比批次"，保持它们原有的判定行为。
+constexpr uint32_t IgnoreWriteBatch = 0xffffffffu;
 
 struct WindowRect {
 	int x                = 0;
@@ -5219,9 +5290,16 @@ struct WindowRect {
 	int width            = 0;
 	int height           = 0;
 	uint32_t order       = 0;
+	// 创建这扇窗口的那一批写入的批次号。order 在相邻两批之间可能相同，
+	// 批次号不会，所以"谁后画"以它为准。
+	uint32_t batch       = 0;
 	uint32_t paper       = 0;
 	bool signature_valid = false;
 	std::array<uint32_t, WindowBorderSamples> signature = {};
+	// 登记签名时该采样点是否被指针压住。指针是游戏画进帧缓冲的，被压住的
+	// 采样点取到的是箭头颜色；如果把它当签名存下来，指针一移开就会每帧
+	// 判成"边框不符"，窗口被 WINDROP 后高清面板立刻穿透对话框。
+	std::array<uint8_t, WindowBorderSamples> signature_known = {};
 	uint8_t lost_frames   = 0;
 	uint16_t hidden_frames = 0;
 };
@@ -5230,10 +5308,12 @@ std::array<WindowRect, MaxWindows> window_rects = {};
 size_t window_rect_count = 0;
 uint32_t window_order = 0;
 
-// 整屏框体（港口 / 航海 / 建筑）最近一次被重绘时的绘制次序。比它早的写入
-// 都属于更早的画面，不可能还盖在框体上面，一律不当作遮挡。
-uint32_t frame_base_order = 0;
-// 只有真的见过一次整屏框体重绘，frame_base_order 才有意义。建筑内往往一次
+// 整屏框体（港口 / 航海 / 建筑）最近一次被重绘时所在的写入批次。更早批次
+// 的窗口已经被这次重绘盖掉，不再当作遮挡；同一批里的窗口是框体之后画的，
+// 必须保留。这里用批次号而不是 blit_order：两批写入之间没有 blit 时 order
+// 相同，靠 order 的等号去推断"同一批"会误杀后画的菜单（实测 mask=0%）。
+uint32_t frame_base_batch = 0;
+// 只有真的见过一次整屏框体重绘，frame_base_batch 才有意义。建筑内往往一次
 // 都没有（子场景复用港口框体），这时不能拿 0 去过滤次序为 0 的早期窗口。
 bool frame_base_known = false;
 // 本帧逐个窗口矩形判定"它真的压在框体上"的结果（1=遮挡，0=其实只是框体
@@ -5247,6 +5327,7 @@ struct WindowCandidate {
 	int x1 = 0;
 	int y1 = 0;
 	uint32_t order = 0;
+	uint32_t batch = 0;
 	int age = 0;
 	bool used = false;
 };
@@ -5441,6 +5522,7 @@ void SEA2_HD_NoteVgaWrite(const uint32_t planar_offset, const uint8_t plane_mask
 	}
 	if (!vga_write_dirty) {
 		vga_write_order = blit_order;
+		++vga_write_batch;
 	}
 	vga_write_planes[planar_offset] |= plane_mask;
 	vga_write_dirty = true;
@@ -6819,7 +6901,7 @@ void SEA2_HD_SetMode(const std::string& mode, const std::string& assets_path)
 	if (!hd_enabled) {
 		window_rect_count = 0;
 		window_order      = 0;
-		frame_base_order  = 0;
+		frame_base_batch  = 0;
 		frame_base_known  = false;
 		window_occludes_valid = false;
 		for (auto& candidate : window_candidates) {
@@ -8659,9 +8741,20 @@ constexpr int FramePictureX      = 0;
 constexpr int FramePictureY      = 40;
 constexpr int FramePictureWidth  = 640;
 constexpr int FramePictureHeight = 400;
-// 逐格守卫：按拟合出的亮度变换预测这一格该是什么色，与实机色逐通道差之和
-// 超过这个值就认为它被菜单高亮、对话框或指针盖住了，保持游戏原样不画高清。
-constexpr int FramePicturePixelTolerance = 24;
+// 整屏底图的匹配方式与内景完全一致：不看色调，只看"这一格是否仍属于参考图
+// 里它那个颜色类"。整屏底图也是 16 色画面，换调色板、淡入都只是每个类整体
+// 换成另一种颜色，像素结构不变，所以逐像素比 RGB 一定失败。
+// 一个类还没有学到本色（或换场景、淡入后本色消失）时，只有这一帧的主色占比
+// 达到这个值才重新学习，避免把覆盖物零星的颜色学成本色。
+constexpr int FrameClassTrustPercent = 50;
+// 一帧画面最多出现多少种不同颜色。整屏底图是 16 色 VGA 画面，换调色板、
+// 淡入都只是把 16 个槽位整体换色，不同颜色的种数不会变。留一点余量。
+// 只有真的做直方图才知道每个类的主色：按"扫描时先遇到哪两种颜色"占槽，
+// 属性面板/头像这类覆盖物会在很早的像素上把槽位占满，把真正的主导色挤掉。
+constexpr int FrameScreenColors = 32;
+// 每个参考颜色类记住几种调色板颜色。海面动画一般只在少数几个调色板槽位
+// 之间轮转，记住轮转范围即可；留足余量后，淡入过程中的连续变色也覆盖得住。
+constexpr int FrameClassColors = 6;
 // 平均亮度低于这个值（0..255）视为淡入起点/纯黑：没有可替换的内容。
 constexpr int FramePictureDarkLuma = 6;
 // HD 图至少要有这么多比例的不透明像素才加载：刚建的空白画布不该参与绘制。
@@ -8692,6 +8785,17 @@ struct ScenePictureArt {
 	std::vector<uint32_t> palette      = {};
 	std::vector<uint8_t> classes       = {};
 	std::vector<uint32_t> class_pixels = {};
+	// 整屏底图的学习结果：每个参考颜色类最近见过的几种当前调色板颜色。
+	//
+	// 地图是静态的，但它的调色板会动：淡入、换场景是整份调色板换色，海面
+	// 这类动画则是调色板在几个槽位之间轮转。只记"上一次的本色"时，调色板
+	// 一转，这个类当场对不上，整块掉回低清，下一帧再对回来——看上去就是
+	// 颜色不断改变的高频闪烁。记一小段历史（环形缓冲）就能让轮转范围内的
+	// 每个颜色都仍然算作这个类，画面稳定。
+	std::array<std::array<uint32_t, FrameClassColors>, ShopPictureMaxPalette>
+	        class_colors      = {};
+	std::array<uint8_t, ShopPictureMaxPalette> class_color_count = {};
+	std::array<uint8_t, ShopPictureMaxPalette> class_color_next  = {};
 };
 
 std::vector<ScenePictureArt> scene_pictures   = {};
@@ -8935,6 +9039,14 @@ void preload_scene_pictures()
 				            art.name.c_str());
 				continue;
 			}
+			// 整屏底图与内景一样按"参考调色板颜色类"匹配：换调色板时只是每个
+			// 类换一种颜色，结构不变，识别与绘制都不该依赖具体色调。
+			build_scene_palette(art);
+			if (art.palette.size() < ShopPictureMinDistinctColors) {
+				LOG_WARNING("SEA2HD: Scene picture %s has no usable palette",
+				            art.name.c_str());
+				continue;
+			}
 			if (art.masked) {
 				// 统计每个低清格的不透明像素数（识别与绘制共用），并要求
 				// 覆盖率达到下限：刚起稿的近空白画布不该参与识别。
@@ -8979,13 +9091,6 @@ void preload_scene_pictures()
 					            static_cast<int>(opaque_total * 100 / pixel_total));
 					continue;
 				}
-				}
-			} else {
-				build_scene_palette(art);
-				if (art.palette.size() < ShopPictureMinDistinctColors) {
-					LOG_WARNING("SEA2HD: Scene picture %s has no usable palette",
-					            art.name.c_str());
-					continue;
 				}
 			}
 			LOG_MSG("SEA2HD: Loaded scene picture %s", art.name.c_str());
@@ -9252,7 +9357,119 @@ void draw_scene_picture(const ScenePictureArt& art, const uint32_t* source,
 // 变换（淡入时整份调色板一起压暗，高清图要跟着压）；第二遍逐格用预测色核对，
 // 对不上说明被菜单高亮、对话框或指针盖住，那一格保持游戏原样。
 // ---------------------------------------------------------------
-void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
+// 游戏自己把箭头画进帧缓冲（奶白填充 + 黑描边），驱动那边没有可用的光标
+// 掩码；但光标位置仍能从 INT 33h 状态直接读到。箭头像素和参考低清图不一样，
+// 所以在指针方框内保留这些像素，仍与参考一致的像素照常换高清。
+struct PointerGuard {
+	uint16_t x     = 0;
+	uint16_t y     = 0;
+	bool available = false;
+
+	PointerGuard()
+	{
+		available = MOUSEDOS_GetCursorPosition(x, y);
+	}
+
+	bool inside(const int x_fb, const int y_fb) const
+	{
+		return available &&
+		       inside_pointer_box(x_fb, y_fb, static_cast<int>(x),
+		                          static_cast<int>(y));
+	}
+
+	// 叠加绘制专用：只覆盖箭头本体，不碰周围的面板/文字。
+	bool inside_draw(const int x_fb, const int y_fb) const
+	{
+		if (!available) {
+			return false;
+		}
+		const int box_left = static_cast<int>(x) - PointerDrawSlack;
+		const int box_top  = static_cast<int>(y) - PointerDrawSlack;
+		return x_fb >= box_left && x_fb < box_left + PointerDrawWidth &&
+		       y_fb >= box_top && y_fb < box_top + PointerDrawHeight;
+	}
+};
+
+int reference_distance(const uint32_t a, const uint32_t b)
+{
+	int distance = 0;
+	for (int shift = 0; shift < 24; shift += 8) {
+		distance += std::abs(static_cast<int>((a >> shift) & 0xff) -
+		                     static_cast<int>((b >> shift) & 0xff));
+	}
+	return distance;
+}
+
+// ---------------------------------------------------------------
+// 指针叠加
+//
+// 箭头是游戏画进帧缓冲的，所以它只能"从低清源里贴回去"。但贴回必须发生在
+// 所有高清层（面板、窗口、文字、数字、立绘……）之后，否则就会像普通图层一样
+// 被后画的东西盖住，或者反过来盖坏别的层。这里拆成两步：
+//   1. 绘制阶段只登记候选像素（与参考图不同的箭头描边）；
+//   2. 合成最后统一按登记表把源像素 4 倍覆盖上去。
+// 这样指针永远在最上层，且不参与任何遮挡/叠加判定。
+// ---------------------------------------------------------------
+std::array<uint8_t, static_cast<size_t>(VgaWidth) * VgaHeight>
+        pointer_overlay_mask = {};
+
+void note_pointer_pixel(const int x, const int y)
+{
+	if (x >= 0 && x < VgaWidth && y >= 0 && y < VgaHeight) {
+		pointer_overlay_mask[static_cast<size_t>(y) * VgaWidth + x] = 1;
+	}
+}
+
+// 后画的整块美术（计算器等 GRAPH 图）会完全盖住底层面板。面板那一遍是按
+// "和面板参考图不同"来猜箭头的，可在这块区域里源像素和面板参考本来就完全
+// 不同，整个指针框都会被登记，贴回去就是一大块低清残影。所以整块美术落地
+// 时先把该矩形内的登记清空，再由它自己按"和自己参考图不同"重新登记箭头。
+void clear_pointer_notes(const int x, const int y, const int width,
+                         const int height)
+{
+	const int x0 = std::max(0, x);
+	const int y0 = std::max(0, y);
+	const int x1 = std::min(VgaWidth, x + width);
+	const int y1 = std::min(VgaHeight, y + height);
+	for (int py = y0; py < y1; ++py) {
+		auto* row =
+		        pointer_overlay_mask.data() + static_cast<size_t>(py) * VgaWidth;
+		for (int px = x0; px < x1; ++px) {
+			row[px] = 0;
+		}
+	}
+}
+
+void draw_pointer_overlay(const uint32_t* source, const int source_width,
+                          uint32_t* destination, const int destination_stride)
+{
+	if (source_width != VgaWidth) {
+		return;
+	}
+	for (int y = 0; y < VgaHeight; ++y) {
+		const auto* src_row =
+		        source + static_cast<size_t>(y) * source_width;
+		for (int x = 0; x < VgaWidth; ++x) {
+			if (pointer_overlay_mask[static_cast<size_t>(y) * VgaWidth + x] ==
+			    0) {
+				continue;
+			}
+			const auto color = src_row[x] & 0x00ffffffu;
+			auto* out = destination +
+			            static_cast<size_t>(y * HdScale) * destination_stride +
+			            x * HdScale;
+			for (int dy = 0; dy < HdScale; ++dy) {
+				auto* row =
+				        out + static_cast<size_t>(dy) * destination_stride;
+				for (int dx = 0; dx < HdScale; ++dx) {
+					row[dx] = color;
+				}
+			}
+		}
+	}
+}
+
+void draw_frame_picture(ScenePictureArt& art, const uint32_t* source,
                         const int source_width, uint32_t* destination,
                         const int destination_stride)
 {
@@ -9263,6 +9480,9 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 	if (art.recognize_only) {
 		return;
 	}
+
+	// 指针位置直接取自 INT 33h 驱动状态，不做任何图像识别。
+	const PointerGuard pointer;
 
 	const int width   = art.width;
 	const int height  = art.height;
@@ -9299,8 +9519,10 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		if (window.lost_frames != 0) {
 			continue;
 		}
-		// 比最近一次整屏框体重绘更早的写入，已经被那次重绘覆盖。
-		if (frame_base_known && window.order <= frame_base_order) {
+		// 比最近一次整屏框体重绘更早批次的写入，已经被那次重绘覆盖。同一批的
+		// 写入是框体之后画的：游戏先铺整屏框体、再画侧边菜单，批次号相等，
+		// 所以这里必须用"批次号小于"而不是"小于等于"。
+		if (frame_base_known && window.batch < frame_base_batch) {
 			continue;
 		}
 		mask_rect(window.x - art.x, window.y - art.y,
@@ -9313,7 +9535,7 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		if (!candidate.used) {
 			continue;
 		}
-		if (frame_base_known && candidate.order <= frame_base_order) {
+		if (frame_base_known && candidate.batch < frame_base_batch) {
 			continue;
 		}
 		const int cw = candidate.x1 - candidate.x0 + 1;
@@ -9326,38 +9548,67 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		          candidate.x1 + 1 - art.x, candidate.y1 + 1 - art.y);
 	}
 
-	// 第一遍：对没被窗口遮住的不透明格拟合"参考色 → 当前色"的整体亮度变换。
-	// 淡入是把整份调色板一起压暗，逐通道 gain/offset 就能吸收；这既是高清图
-	// 要跟着压的增益，也是下面逐格核对的预测依据。与内景共用 solve_fit。
-	FitSums sums         = {};
-	int covered          = 0;
-	uint64_t screen_luma = 0;
-	for (int y = 0; y < height; ++y) {
+	// 第一遍：收集这一帧实际用到的颜色。整屏底图是 16 色画面，换调色板、
+	// 淡入都只是把整份调色板整体换色，颜色种数不变。
+	const int class_count = static_cast<int>(art.palette.size());
+	std::array<uint32_t, FrameScreenColors> screen_colors = {};
+	int screen_color_count                               = 0;
+	int covered                                          = 0;
+	uint64_t screen_luma                                 = 0;
+	for (int y = 0; y < height && screen_color_count < FrameScreenColors; ++y) {
 		const auto* srow = row_at(y);
 		const auto* crow = art.cell_opaque.data() +
 		                   static_cast<size_t>(y) * width;
-		const auto* lrow = art.low.data() + static_cast<size_t>(y) * width;
 		for (int x = 0; x < width; ++x) {
 			const auto index = static_cast<size_t>(y) * width + x;
 			if (crow[x] < HdScale * HdScale / 2 || window_mask[index] != 0) {
 				continue;
 			}
 			const auto color = srow[x] & 0x00ffffffu;
-			const auto ref   = lrow[x] & 0x00ffffffu;
-			for (auto channel = 0; channel < 3; ++channel) {
-				const auto shift   = channel * 8;
-				const auto stored  = (ref >> shift) & 0xff;
-				const auto actual  = (color >> shift) & 0xff;
-				sums.stored[channel] += stored;
-				sums.actual[channel] += actual;
-				sums.stored_sq[channel] +=
-				        static_cast<uint64_t>(stored) * stored;
-				sums.stored_act[channel] +=
-				        static_cast<uint64_t>(stored) * actual;
+			auto known       = false;
+			for (auto slot = 0; slot < screen_color_count; ++slot) {
+				if (screen_colors[slot] == color) {
+					known = true;
+					break;
+				}
 			}
-			++sums.samples;
+			if (!known) {
+				if (screen_color_count >= FrameScreenColors) {
+					continue;
+				}
+				screen_colors[screen_color_count++] = color;
+			}
+		}
+	}
+	// 第二遍：按参考调色板的颜色类做真正的直方图。
+	// 每个类的主导色必须靠全图统计得出：若按"扫描时先遇到的两种颜色"占槽，
+	// 属性面板 / 头像这些在扫描早期出现的覆盖物会把槽位占满，把真正的本色
+	// 挤掉，可信度就会凭空塌掉，整片区域掉回低清。
+	std::array<std::array<int, FrameScreenColors>, ShopPictureMaxPalette> hist = {};
+	// 每一类这一帧实际看到的像素数。可信度必须相对"看得到的部分"算：
+	// 否则属性面板一打开，被盖住一角的类整类被判不可信，整片区域掉低清。
+	std::array<int, ShopPictureMaxPalette> class_seen = {};
+	for (int y = 0; y < height; ++y) {
+		const auto* srow = row_at(y);
+		const auto* crow = art.cell_opaque.data() +
+		                   static_cast<size_t>(y) * width;
+		const auto* cls = art.classes.data() + static_cast<size_t>(y) * width;
+		for (int x = 0; x < width; ++x) {
+			const auto index = static_cast<size_t>(y) * width + x;
+			if (crow[x] < HdScale * HdScale / 2 || window_mask[index] != 0) {
+				continue;
+			}
+			const auto color  = srow[x] & 0x00ffffffu;
+			const auto cls_id = cls[x];
+			++class_seen[cls_id];
 			screen_luma += luma_of(color);
 			++covered;
+			for (auto slot = 0; slot < screen_color_count; ++slot) {
+				if (screen_colors[slot] == color) {
+					++hist[cls_id][slot];
+					break;
+				}
+			}
 		}
 	}
 
@@ -9367,7 +9618,143 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		return;
 	}
 
-	const auto fit = solve_fit(sums);
+	// 覆盖物颜色：底图的一种颜色只会出现在它自己那一类里，而属性面板 /
+	// 对话框是整块盖在底图上的，它的纸色会同时落进很多个参考颜色类。
+	// 这类颜色成片出现时不画高清、也不参与学习；否则参考图里恰好也用这个
+	// 颜色的那一类会把高清画到面板上——这正是属性框上那块"穿透"。
+	constexpr int FrameOverlayColorClasses = 3;
+	constexpr int FrameOverlayColorPercent = 10;
+	// 覆盖物颜色至少连续这么多个像素（同一行）才算"成片"的覆盖物。属性框
+	// 纸面是几十上百像素宽的整块；地图上与它同色的细节只有一两个像素。
+	constexpr int FrameOverlayRunLength = 8;
+	std::array<bool, FrameScreenColors> overlay_color = {};
+	int overlay_count = 0;
+	for (auto slot = 0; slot < screen_color_count; ++slot) {
+		auto classes = 0;
+		for (auto c = 0; c < class_count; ++c) {
+			if (class_seen[c] > 0 &&
+			    hist[c][slot] * 100 >= class_seen[c] * FrameOverlayColorPercent) {
+				++classes;
+			}
+		}
+		overlay_color[slot] = classes >= FrameOverlayColorClasses;
+		if (overlay_color[slot]) {
+			++overlay_count;
+		}
+	}
+
+	// 学习：把每个类这一帧的主色记进它的颜色历史。
+	//
+	// 只有主色占比够高、不是覆盖物颜色、而且是这一帧里独占的颜色才记。
+	// 覆盖物（属性面板纸色）会同时成为好几个类的主色，独占性检查直接把
+	// 它挡在外面；淡入、海面动画则每帧给每个类记一种新颜色，一段时间后
+	// 轮转范围内的颜色都在历史里，画面就不再随调色板闪烁。
+	std::array<int, ShopPictureMaxPalette> best_slot = {};
+	std::array<uint32_t, ShopPictureMaxPalette> candidate = {};
+	std::array<bool, ShopPictureMaxPalette> candidate_ok   = {};
+	std::array<int, FrameScreenColors> candidate_classes   = {};
+	for (auto c = 0; c < class_count; ++c) {
+		auto best = 0;
+		for (auto slot = 1; slot < screen_color_count; ++slot) {
+			if (hist[c][slot] > hist[c][best]) {
+				best = slot;
+			}
+		}
+		best_slot[c]     = best;
+		const auto seen  = class_seen[c];
+		const auto share = seen > 0 ? hist[c][best] * 100 / seen : 0;
+		if (hist[c][best] > 0 && share >= FrameClassTrustPercent &&
+		    !overlay_color[best]) {
+			candidate[c]     = screen_colors[best];
+			candidate_ok[c]  = true;
+			++candidate_classes[best];
+		}
+	}
+	for (auto c = 0; c < class_count; ++c) {
+		if (!candidate_ok[c] || candidate_classes[best_slot[c]] > 1) {
+			continue;
+		}
+		auto known = false;
+		for (auto k = 0; k < art.class_color_count[c]; ++k) {
+			if (art.class_colors[c][k] == candidate[c]) {
+				known = true;
+				break;
+			}
+		}
+		if (known) {
+			continue;
+		}
+		const auto slot = art.class_color_next[c];
+		art.class_colors[c][slot] = candidate[c];
+		art.class_color_next[c] =
+		        static_cast<uint8_t>((slot + 1) % FrameClassColors);
+		if (art.class_color_count[c] < FrameClassColors) {
+			++art.class_color_count[c];
+		}
+	}
+
+	// 这一类只要有一个已知本色还留在它自己的像素里，就仍然可信。完全不
+	// 可信只发生在整类都被覆盖物压住时，那时本来也没有底图可画。
+	std::array<bool, ShopPictureMaxPalette> class_trusted = {};
+	for (auto c = 0; c < class_count; ++c) {
+		for (auto k = 0; k < art.class_color_count[c] && !class_trusted[c];
+		     ++k) {
+			for (auto slot = 0; slot < screen_color_count; ++slot) {
+				if (screen_colors[slot] == art.class_colors[c][k] &&
+				    hist[c][slot] > 0) {
+					class_trusted[c] = true;
+					break;
+				}
+			}
+		}
+	}
+	// 高清明暗直接用高清素材本身的颜色，不再跟随实机调色板。参考图与实机
+	// 是 16 色调色板的一一置换，通道之间没有线性关系；任何 gain/offset 拟合
+	// 都会逐帧乱跳（实测同一画面 gain 在 0.5、1.0、0.0 之间来回），表现就是
+	// 底图颜色闪烁。上面已经确认"结构对得上"，色调就不该再参与绘制。
+	std::array<ChannelFit, 3> fit = {};
+
+	// 这一格是不是仍属于参考图里它那个颜色类：颜色必须等于该类学到的本色。
+	// 判据与色调无关（学到的颜色就是当前调色板里的实际颜色），换调色板、
+	// 淡入都会重新学习；而覆盖物的颜色不属于任何一类，因此不会被画上高清。
+	//
+	// 覆盖物颜色只在"成片"出现时才停画：属性框的纸色与参考图里的一类散点
+	// 同色（只差一个色阶），纸是整片画上去的，而地图上的同色散点只有一两个
+	// 像素宽。若一律按颜色停画，地图上那些散点会变成成片的低清白点。
+	//
+	// 成片的同色横条并不都是覆盖物：左右面板上被游戏重画过的文字笔画，
+	// 长度也在 8 像素以上，而黑字同时落进参考图的很多颜色类，会被判成
+	// "覆盖物色"。判据再收紧一格——只要这一格的帧缓冲颜色和参考图逐像素
+	// 相同（reference），说明这里就是底图本身，游戏没有盖任何东西，照底图
+	// 换高清。真正的对话框纸色与底图相差一个色阶，不会命中这一条。
+	const auto belongs = [&](const uint8_t cls_id, const uint32_t color,
+	                         const int run, const uint32_t reference) {
+		if (cls_id >= class_count || !class_trusted[cls_id]) {
+			return false;
+		}
+		if (run >= FrameOverlayRunLength && color != reference) {
+			for (auto slot = 0; slot < screen_color_count; ++slot) {
+				if (overlay_color[slot] && screen_colors[slot] == color) {
+					return false;
+				}
+			}
+		}
+		for (auto k = 0; k < art.class_color_count[cls_id]; ++k) {
+			const auto known = art.class_colors[cls_id][k];
+			int difference   = 0;
+			for (auto channel = 0; channel < 3; ++channel) {
+				const auto shift = channel * 8;
+				const auto a =
+				        static_cast<int>((color >> shift) & 0xff);
+				const auto b = static_cast<int>((known >> shift) & 0xff);
+				difference += a > b ? a - b : b - a;
+			}
+			if (difference <= ShopPictureTolerance) {
+				return true;
+			}
+		}
+		return false;
+	};
 	bool fit_identity = true;
 	uint8_t gain_lut[3][256] = {};
 	for (auto channel = 0; channel < 3; ++channel) {
@@ -9390,6 +9777,64 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		       (static_cast<uint32_t>(g) << 8) |
 		       (static_cast<uint32_t>(b) << 16);
 	};
+
+	// 指针方框这一帧是不是压在底图本身上：方框内大部分像素都属于某个可信
+	// 颜色类才算。压在立绘、面板、窗口上时颜色本来就不属于底图，逐格登记
+	// 会把整块方框贴成低清（鼠标周围出现一个低清方框）。那种地方应该由
+	// 对应的图层自己按它自己的参考像素精确登记箭头，这里一格都不登。
+	bool pointer_over_picture = false;
+	if (pointer.available) {
+		const int box_left = static_cast<int>(pointer.x) - PointerDrawSlack;
+		const int box_top  = static_cast<int>(pointer.y) - PointerDrawSlack;
+		int inside_box     = 0;
+		int map_pixels     = 0;
+		for (auto dy = 0; dy < PointerDrawHeight; ++dy) {
+			const int ly = box_top + dy - art.y;
+			if (ly < 0 || ly >= height) {
+				continue;
+			}
+			const auto* srow = source +
+			                   static_cast<size_t>(art.y + ly) * source_width +
+			                   art.x;
+			const auto* cls_row =
+			        art.classes.data() + static_cast<size_t>(ly) * width;
+			const auto* cell_row =
+			        art.cell_opaque.data() + static_cast<size_t>(ly) * width;
+			for (auto dx = 0; dx < PointerDrawWidth; ++dx) {
+				const int lx = box_left + dx - art.x;
+				if (lx < 0 || lx >= width) {
+					continue;
+				}
+				if (cell_row[lx] < HdScale * HdScale / 2 ||
+				    window_mask[static_cast<size_t>(ly) * width + lx] != 0) {
+					continue;
+				}
+				++inside_box;
+				const auto color = srow[lx] & 0x00ffffffu;
+				const auto reference =
+				        art.low[static_cast<size_t>(ly) * width + lx] &
+				        0x00ffffffu;
+				int run          = 1;
+				for (int i = lx - 1;
+				     i >= 0 && run < FrameOverlayRunLength &&
+				     (srow[i] & 0x00ffffffu) == color;
+				     --i) {
+					++run;
+				}
+				for (int i = lx + 1;
+				     i < width && run < FrameOverlayRunLength &&
+				     (srow[i] & 0x00ffffffu) == color;
+				     ++i) {
+					++run;
+				}
+				if (belongs(cls_row[lx], color, run, reference)) {
+					++map_pixels;
+				}
+			}
+		}
+		pointer_over_picture = inside_box >= PointerDrawWidth * PointerDrawHeight / 2 &&
+		                       map_pixels * 2 >= inside_box;
+	}
 
 	// 只在窗口数量变化时记一行：确认对话框到底有没有被写追踪登记上，是排查
 	// "面板穿透 / 露出部分掉高清"的第一手依据。
@@ -9431,25 +9876,36 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 			const auto* srow = row_at(y);
 			const auto* crow = art.cell_opaque.data() +
 			                   static_cast<size_t>(y) * width;
-			const auto* lrow = art.low.data() +
-			                   static_cast<size_t>(y) * width;
+			const auto* cls = art.classes.data() +
+			                  static_cast<size_t>(y) * width;
 			for (int x = x0; x < x1; x += 2) {
 				if (crow[x] < HdScale * HdScale / 2) {
 					continue;
 				}
-				++samples;
-				const auto predicted = modulate(lrow[x] & 0x00ffffffu);
-				const auto current   = srow[x] & 0x00ffffffu;
-				int difference = 0;
-				for (auto channel = 0; channel < 3; ++channel) {
-					const auto shift = channel * 8;
-					const auto a =
-					        static_cast<int>((predicted >> shift) & 0xff);
-					const auto b =
-					        static_cast<int>((current >> shift) & 0xff);
-					difference += a > b ? a - b : b - a;
+				// 指针像素不是窗口内容，参与比对会把"这是不是真窗口"判歪。
+				if (pointer.inside(art.x + x, art.y + y)) {
+					continue;
 				}
-				if (difference > FramePicturePixelTolerance) {
+				++samples;
+				// 与逐像素绘制同一判据：这一格已经不再属于参考图的颜色类，
+				// 说明它是窗口 / 对话框画上去的内容；否则只是框体被重画。
+				const auto color = srow[x] & 0x00ffffffu;
+				int run          = 1;
+				for (int i = x - 1;
+				     i >= 0 && run < FrameOverlayRunLength &&
+				     (srow[i] & 0x00ffffffu) == color;
+				     --i) {
+					++run;
+				}
+				for (int i = x + 1;
+				     i < width && run < FrameOverlayRunLength &&
+				     (srow[i] & 0x00ffffffu) == color;
+				     ++i) {
+					++run;
+				}
+				if (!belongs(cls[x], color, run,
+				             art.low[static_cast<size_t>(y) * width + x] &
+				                     0x00ffffffu)) {
 					++mismatch;
 				}
 			}
@@ -9465,7 +9921,7 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 	for (size_t i = 0; i < window_rect_count; ++i) {
 		const auto& window = window_rects[i];
 		if (window.lost_frames != 0 ||
-		    (frame_base_known && window.order <= frame_base_order)) {
+		    (frame_base_known && window.batch < frame_base_batch)) {
 			continue;
 		}
 		const int x0 = std::max(0, window.x - art.x);
@@ -9491,7 +9947,7 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 	}
 	for (const auto& candidate : window_candidates) {
 		if (!candidate.used ||
-		    (frame_base_known && candidate.order <= frame_base_order)) {
+		    (frame_base_known && candidate.batch < frame_base_batch)) {
 			continue;
 		}
 		const int cw = candidate.x1 - candidate.x0 + 1;
@@ -9512,24 +9968,104 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		}
 	}
 
-	// 第二遍：遮挡已经在上面按矩形定完，这里只剩两道无条件判定——素材 alpha
-	// 与遮挡掩码。画不画高清不再依赖像素颜色，所以同一片面板在任何场景、
-	// 任何淡入阶段的表现都一致。
+	// 六个角色头像的装饰外框（含右、下阴影）是底图 graph2 自带的一部分。
+	// 点击头像时游戏会用高亮色把这一圈重画一遍（按下与弹起是两种样子），
+	// 颜色一时不属于任何可信颜色类，整圈就会掉回 4 倍低清。这里把这一圈
+	// 认作底图：只要这格没被窗口压住、颜色也不是覆盖物纸色，就照底图换
+	// 高清。不能因为头像内部被改画（按下高亮、换表情）就整圈放弃——外框
+	// 本来就不属于头像本体，内部怎么变都不影响它。
+	constexpr int PortraitFrameSlack = 2;
+	std::array<const DrawCommand*, ScenePortraitBoxes.size()> portrait_frames = {};
+	for (const auto& command : draw_commands) {
+		for (size_t i = 0; i < ScenePortraitBoxes.size(); ++i) {
+			if (command.x == ScenePortraitBoxes[i].first &&
+			    command.y == ScenePortraitBoxes[i].second) {
+				portrait_frames[i] = &command;
+			}
+		}
+	}
+	std::array<bool, ScenePortraitBoxes.size()> portrait_frame_paintable = {};
+	for (size_t i = 0; i < portrait_frames.size(); ++i) {
+		const auto* command = portrait_frames[i];
+		portrait_frame_paintable[i] = command != nullptr && command->matched_last;
+	}
+	const auto in_portrait_frame_ring = [&](const int sx, const int sy) {
+		for (size_t i = 0; i < portrait_frames.size(); ++i) {
+			if (!portrait_frame_paintable[i]) {
+				continue;
+			}
+			const auto* command = portrait_frames[i];
+			const int px        = static_cast<int>(command->x);
+			const int py        = static_cast<int>(command->y) + ContentYOffset;
+			const int left      = px - PortraitFrameLeft - PortraitFrameSlack;
+			const int top       = py - PortraitFrameTop - PortraitFrameSlack;
+			const int right =
+			        px + Kao64Width + PortraitFrameRight + PortraitFrameSlack;
+			const int bottom =
+			        py + Kao64Height + PortraitFrameBottom + PortraitFrameSlack;
+			if (sx < left || sx >= right || sy < top || sy >= bottom) {
+				continue;
+			}
+			// 头像本体由立绘层负责，这里只管外圈边框。
+			if (sx >= px && sx < px + Kao64Width && sy >= py &&
+			    sy < py + Kao64Height) {
+				continue;
+			}
+			return true;
+		}
+		return false;
+	};
+	const auto is_overlay_color = [&](const uint32_t color) {
+		for (auto slot = 0; slot < screen_color_count; ++slot) {
+			if (screen_colors[slot] == color && overlay_color[slot]) {
+				return true;
+			}
+		}
+		return false;
+	};
+
+	// 第二遍：矩形遮挡先定完，然后两道判定——逐格守卫与素材 alpha。
+	// 逐格守卫是安全网：游戏在底图之后画的东西只要没被写追踪登记成窗口，
+	// 矩形这一层就看不见它，但它和"参考图按当前亮度变换后的预测色"必然
+	// 对不上。这一层与窗口登记是否完整无关，所以头像框、人物属性面板这类
+	// 漏登记的界面不会在任何场景、任何阶段被底图高清盖住。
 	//
-	// 诊断：左右面板分别统计"要画的格 / 真正画上的格 / 被矩形挡掉的格"。
+	// 诊断：左右面板分别统计"要画的格 / 真正画上的格 / 被矩形挡掉的格 /
+	// 被逐格守卫挡掉的格"。
 	struct CellTally {
 		int candidate = 0;
 		int ok        = 0;
 		int window    = 0;
+		int guard     = 0;
 	};
 	CellTally left_tally = {};
 	CellTally right_tally = {};
+	int considered         = 0;
+	int guarded            = 0;
 	const int high_stride = width * HdScale;
 	for (int y = 0; y < height; ++y) {
 		const auto* crow = art.cell_opaque.data() +
 		                   static_cast<size_t>(y) * width;
 		const auto* hrow = art.high.data() +
 		                   static_cast<size_t>(y * HdScale) * high_stride;
+		const auto* srow = row_at(y);
+		const auto* lrow = art.low.data() + static_cast<size_t>(y) * width;
+		const auto* cls  = art.classes.data() + static_cast<size_t>(y) * width;
+		// 本行同色连续长度：覆盖物纸色是成片的大块，底图里的同色散点只有
+		// 一两个像素宽，靠它区分"这片纸"和"地图上的白点"。
+		std::array<uint16_t, VgaWidth> run_row = {};
+		for (int x = 0; x < width;) {
+			const auto color = srow[x] & 0x00ffffffu;
+			auto end         = x + 1;
+			while (end < width && (srow[end] & 0x00ffffffu) == color) {
+				++end;
+			}
+			const auto len = static_cast<uint16_t>(end - x);
+			for (auto i = x; i < end; ++i) {
+				run_row[i] = len;
+			}
+			x = end;
+		}
 		auto* drow = destination +
 		             static_cast<size_t>(art.y + y) * HdScale *
 		                     destination_stride +
@@ -9555,6 +10091,35 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 				}
 				continue;  // 中央动态窗口 / 对话框 / 菜单压住的格子
 			}
+			++considered;
+			// 指针只在此登记候选像素，不参与本函数的遮挡与叠加判定，
+			// 合成最后统一由 draw_pointer_overlay() 覆盖到最上层。
+			// 判据是"这一格的颜色已经不是它那个参考颜色类的本色"：实机与
+			// 参考图的调色板是整体置换的，按参考色逐像素比 RGB 会几乎全中，
+			// 把整个指针方框都登记成低清（箭头周围一圈低清像素）。逐类比对
+			// 本色则只留下真正不属于底图的像素，也就是箭头本体。
+			if (pointer_over_picture && pointer.inside_draw(sx, art.y + y) &&
+			    !belongs(cls[x], srow[x] & 0x00ffffffu, run_row[x],
+			             lrow[x] & 0x00ffffffu)) {
+				note_pointer_pixel(sx, art.y + y);
+			}
+			// 结构判定：这一格是否仍属于参考图里它那个颜色类。对话框、
+			// 人物属性面板、头像、指针都不属于任何可信类，保持游戏原样；
+			// 判据与色调无关，换调色板、淡入、整体偏色都不会误判。
+			if (!belongs(cls[x], srow[x] & 0x00ffffffu, run_row[x],
+			             lrow[x] & 0x00ffffffu)) {
+				// 头像装饰外框是底图的一部分：点击时被高亮色重画会导致
+				// 颜色一时对不上，这里仍按底图换高清，避免整圈短暂掉低清。
+				const auto color = srow[x] & 0x00ffffffu;
+				if (!(in_portrait_frame_ring(sx, art.y + y) &&
+				      !is_overlay_color(color))) {
+					if (tally != nullptr) {
+						++tally->guard;
+					}
+					++guarded;
+					continue;
+				}
+			}
 			if (tally != nullptr) {
 				++tally->ok;
 			}
@@ -9579,8 +10144,31 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 			}
 		}
 	}
+	// 结构匹配的落点：keep 是"不属于参考图任何可信类"（对话框、面板、头像、
+	// 指针）而被保留为游戏像素的格子占比；trusted 是当前帧真正建立起可靠
+	// "参考类 → 当前色"对应关系的类数。两者一起看就能判断底图是否还在。
+	{
+		static int logged_key = -1;
+		const int keep_percent =
+		        considered == 0 ? 0 : guarded * 100 / considered;
+		int trusted = 0;
+		for (auto c = 0; c < class_count; ++c) {
+			if (class_trusted[c]) {
+				++trusted;
+			}
+		}
+		if (keep_percent != logged_key || composite_count % 120 == 0) {
+			logged_key = keep_percent;
+			diag("FRAMEMATCH %s cls=%d trusted=%d ovl=%d keep=%d%% considered=%d fit=%d gain=%.2f/%.2f/%.2f off=%.0f/%.0f/%.0f frame=%u",
+			     art.name.c_str(), class_count, trusted, overlay_count,
+			     keep_percent,
+			     considered, fit_identity ? 1 : 0, fit[0].gain, fit[1].gain,
+			     fit[2].gain, fit[0].offset, fit[1].offset, fit[2].offset,
+			     static_cast<unsigned>(composite_count));
+		}
+	}
 	// 面板覆盖率：数值一变就打一行（静态画面不会有新帧，定期打点等于不打），
-// 另外每 60 个合成帧补一行做节拍。
+	// 另外每 60 个合成帧补一行做节拍。
 	if (art.name == "port") {
 		static int logged_key = -1;
 		const int key = (scene_in_building ? 1000000 : 0) +
@@ -9588,12 +10176,14 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 		                left_tally.window + right_tally.window * 3;
 		if (key != logged_key || composite_count % 60 == 0) {
 			logged_key = key;
-			diag("PANELCOV building=%d L cand=%d ok=%d win=%d | R cand=%d ok=%d win=%d | windows=%u rects kept=%d skipped=%d frame=%u",
+			diag("PANELCOV building=%d L cand=%d ok=%d win=%d | R cand=%d ok=%d win=%d | windows=%u rects kept=%d skipped=%d ptr=%d,%d has=%d frame=%u",
 			     scene_in_building ? 1 : 0, left_tally.candidate,
 			     left_tally.ok, left_tally.window, right_tally.candidate,
 			     right_tally.ok, right_tally.window,
 			     static_cast<unsigned>(window_rect_count), rect_kept,
-			     rect_skipped, static_cast<unsigned>(composite_count));
+			     rect_skipped, static_cast<int>(pointer.x),
+			     static_cast<int>(pointer.y), pointer.available ? 1 : 0,
+			     static_cast<unsigned>(composite_count));
 		}
 	}
 	// 诊断：把当前整屏存成 PPM，供离线比对参考图，找出建筑内面板到底
@@ -9624,6 +10214,36 @@ void draw_frame_picture(const ScenePictureArt& art, const uint32_t* source,
 				     static_cast<unsigned>(composite_count));
 			}
 		}
+	}
+	// 新游戏底图：同时导出实机画面与"参考图按当前亮度变换后的预测"。两者
+	// 若构图一致，说明只是拟合偏了；若构图不同，说明屏幕上的画面根本不是
+	// 这张参考图，任何亮度变换都无从谈起。
+	if (art.folder == "NEWGAME" && composite_count % 120 == 0) {
+		const auto dump_ppm = [&](const char* path, const bool predict) {
+			auto* out = std::fopen(path, "wb");
+			if (!out) {
+				return;
+			}
+			std::fprintf(out, "P6\n%d %d\n255\n", width, height);
+			for (int y = 0; y < height; ++y) {
+				const auto* row = row_at(y);
+				const auto* lrow =
+				        art.low.data() + static_cast<size_t>(y) * width;
+				for (int x = 0; x < width; ++x) {
+					const auto c = predict ? modulate(lrow[x]) : row[x];
+					const uint8_t rgb[3] = {
+					        static_cast<uint8_t>((c >> 16) & 0xff),
+					        static_cast<uint8_t>((c >> 8) & 0xff),
+					        static_cast<uint8_t>(c & 0xff)};
+					std::fwrite(rgb, 1, 3, out);
+				}
+			}
+			std::fclose(out);
+		};
+		dump_ppm("sea2-hd-frame-newgame.ppm", false);
+		dump_ppm("sea2-hd-predict-newgame.ppm", true);
+		diag("FRAMEDUMP newgame frame=%u",
+		     static_cast<unsigned>(composite_count));
 	}
 }
 
@@ -9908,7 +10528,7 @@ bool main_menu_text_matches()
 void draw_newgame_picture(const uint32_t* source, const int source_width,
                           uint32_t* destination, const int destination_stride)
 {
-	for (const auto& art : scene_pictures) {
+	for (auto& art : scene_pictures) {
 		if (art.masked && art.folder == "NEWGAME") {
 			draw_frame_picture(art, source, source_width, destination,
 			                   destination_stride);
@@ -9919,7 +10539,7 @@ void draw_newgame_picture(const uint32_t* source, const int source_width,
 void draw_port_picture(const uint32_t* source, const int source_width,
                        uint32_t* destination, const int destination_stride)
 {
-	for (const auto& art : scene_pictures) {
+	for (auto& art : scene_pictures) {
 		if (art.masked && art.folder == "FRAMES" && art.name == "port") {
 			draw_frame_picture(art, source, source_width, destination,
 			                   destination_stride);
@@ -9930,7 +10550,7 @@ void draw_port_picture(const uint32_t* source, const int source_width,
 void draw_sea_picture(const uint32_t* source, const int source_width,
                       uint32_t* destination, const int destination_stride)
 {
-	for (const auto& art : scene_pictures) {
+	for (auto& art : scene_pictures) {
 		if (art.masked && art.folder == "FRAMES" && art.name == "sea") {
 			draw_frame_picture(art, source, source_width, destination,
 			                   destination_stride);
@@ -10079,6 +10699,11 @@ void preload_graph_arts()
 		    name.compare(name.size() - PngSuffixLen, PngSuffixLen, ".png") != 0) {
 			continue;
 		}
+		// 是/否选择框也放在这个目录，但它有专用管线（第三层，最后覆盖），
+		// 不能再被当成普通 GRAPH 窗口参与遮挡判定。
+		if (name.compare(0, 5, "yesno") == 0) {
+			continue;
+		}
 		const auto low_path = (dir / name).string();
 		auto* loaded        = IMG_Load(low_path.c_str());
 		if (!loaded) {
@@ -10208,6 +10833,9 @@ void draw_graph_pictures(const uint32_t* source, const int source_width,
 	++graph_search_tick;
 	const bool search_now = (graph_search_tick % GraphSearchInterval) == 0;
 
+	// 计算器这类整块位图窗口也整块覆盖绘制，箭头像素同样要让出来。
+	const PointerGuard pointer;
+
 	for (auto& art : graph_arts) {
 		bool matched = false;
 		if (art.x >= 0 && art.y >= 0 && art.x + art.width <= VgaWidth &&
@@ -10277,6 +10905,8 @@ void draw_graph_pictures(const uint32_t* source, const int source_width,
 			}
 			continue;
 		}
+		// 这张图整块覆盖底层面板，先撤掉面板那一遍在它范围内猜出的箭头像素。
+		clear_pointer_notes(art.x, art.y, art.width, art.height);
 		if (art.high.empty()) {
 			// 还没有高清图：把这块从底层高清面板手里收回来，按 4 倍最近
 			// 邻还原游戏原像素，否则面板高清会整块盖住这个窗口。
@@ -10316,6 +10946,20 @@ void draw_graph_pictures(const uint32_t* source, const int source_width,
 				auto* out       = drow +
 				                  static_cast<size_t>(dy) * destination_stride;
 				for (int dx = 0; dx < high_stride; ++dx) {
+					const int x = dx / HdScale;
+					if (pointer.inside_draw(art.x + x, art.y + y) &&
+					    reference_distance(
+					            art.low[static_cast<size_t>(y) * art.width + x] &
+					                    0x00ffffffu,
+					            source[static_cast<size_t>(art.y + y) *
+					                           source_width +
+					                   art.x + x] &
+					                    0x00ffffffu) >
+					            PointerDrawTolerance) {
+						// 箭头像素：只登记，最终统一由 draw_pointer_overlay()
+						// 覆盖到最上层。
+						note_pointer_pixel(art.x + x, art.y + y);
+					}
 					if ((src[dx] >> 24) >= 128) {
 						out[dx] = src[dx] & 0x00ffffffu;
 					}
@@ -10323,6 +10967,423 @@ void draw_graph_pictures(const uint32_t* source, const int source_width,
 			}
 		}
 		mark_hd_art(art.x, art.y, art.width, art.height);
+	}
+}
+
+// ---------------------------------------------------------------
+// YESNO 管线：是/否选择框。
+//
+// 画面层次（由低到高）：
+//   1. 全屏底图（FRAMES / NEWGAME）
+//   2. 对话框 / 菜单 / 窗口 / 立绘（含窗口恢复与文字）
+//   3. 是/否选择框（本管线，最后一块覆盖层）
+//   4. 鼠标指针（draw_pointer_overlay，永远最后）
+//
+// 选择框只在游戏把整块框体写进帧缓冲后才会被识别，它的低清像素一定完整
+// 地躺在 source 里（立绘等由本管线之后的绘制负责，不会反过来压住它）。
+// 因此这里按“上一次的位置原地核对 → 对不上再全屏搜索”的方式定位，命中
+// 后整块覆盖绘制，天然满足“只有鼠标能盖住选择框”。
+//
+// 选择框有两种状态，只有两个按钮的填充色互换，框体完全一致：
+//   默认态：是 粉底蓝字 / 否 绿底橙字
+//   按下态：是 绿底橙字 / 否 粉底蓝字（点击“否”之后）
+// 两态各用一张基准图、各用一张高清图，命中哪张就画哪张。
+//
+// 目录约定（与 GRAPH 共用目录，但由本管线单独识别、单独分层绘制）：
+//   assets/original/GRAPH/yesno-yes-144x56.png   默认态基准图（尺寸即图片尺寸）
+//   assets/original/GRAPH/yesno-no-144x56.png    按下态基准图
+//   assets/hd/GRAPH/yesno-yes-144x56.png         默认态 4 倍高清图
+//   assets/hd/GRAPH/yesno-no-144x56.png          按下态 4 倍高清图
+// 高清图暂时可以没有：仍然识别并打 YESNOMATCH 日志，按 4 倍原始像素覆盖，
+// 这样立绘等低层内容不会穿透选择框。
+// ---------------------------------------------------------------
+// 选择框里“是”按钮的粉色。它只在按钮内部大面积出现，其他画面里顶多几个
+// 零散像素，用它当搜索闸门，避免每帧都做整屏搜索。
+constexpr uint32_t YesNoPink     = 0x00d261a2u;
+constexpr int YesNoPinkMin       = 150;
+constexpr int YesNoSearchTick    = 4;    // 未命中时每 4 帧搜一次
+constexpr int YesNoMatchPercent  = 70;   // 整图一致率下限
+constexpr int YesNoAnchorMin     = 14;   // 16 个锚点至少要命中几个
+constexpr int YesNoLogInterval   = 60;
+
+// 两种状态：0 = 默认（是 高亮），1 = 点击“否”（否 高亮）。
+constexpr int YesNoStateCount = 2;
+
+GraphArt yesno_arts[YesNoStateCount] = {};
+bool yesno_attempted             = false;
+int yesno_search_tick            = 0;
+int yesno_state                  = -1;   // 上次命中哪种状态
+int yesno_x                      = -1;   // 上次命中的位置（两态共用）
+int yesno_y                      = -1;
+// 粉色按钮在基准图里的左上角，用来把整屏搜索降级成“局部核对”。
+int yesno_pink_x[YesNoStateCount] = {-1, -1};
+int yesno_pink_y[YesNoStateCount] = {-1, -1};
+
+void reset_yesno_art()
+{
+	for (auto& art : yesno_arts) {
+		art    = GraphArt{};
+		art.x  = -1;
+		art.y  = -1;
+	}
+	yesno_attempted   = false;
+	yesno_search_tick = 0;
+	yesno_state       = -1;
+	yesno_x           = -1;
+	yesno_y           = -1;
+	for (int state = 0; state < YesNoStateCount; ++state) {
+		yesno_pink_x[state] = -1;
+		yesno_pink_y[state] = -1;
+	}
+}
+
+void preload_yesno_art()
+{
+	if (yesno_attempted) {
+		return;
+	}
+	yesno_attempted = true;
+
+	static const char* const names[YesNoStateCount] = {
+	        "yesno-yes-144x56", "yesno-no-144x56"};
+	for (int state = 0; state < YesNoStateCount; ++state) {
+		const auto file     = std::string(names[state]) + ".png";
+		const auto low_path = (assets_original_root / "GRAPH" / file).string();
+		std::error_code error;
+		if (!std::filesystem::is_regular_file(low_path, error)) {
+			continue;
+		}
+		auto* loaded = IMG_Load(low_path.c_str());
+		if (!loaded) {
+			continue;
+		}
+		const int width  = loaded->w;
+		const int height = loaded->h;
+		SDL_FreeSurface(loaded);
+		if (width <= 0 || height <= 0 || width > VgaWidth ||
+		    height > VgaHeight) {
+			continue;
+		}
+		if (state > 0 && (width != yesno_arts[0].width ||
+		                  height != yesno_arts[0].height)) {
+			LOG_WARNING("SEA2HD: YESNO %s has a different size",
+			            names[state]);
+			continue;
+		}
+
+		GraphArt art = {};
+		art.name     = names[state];
+		art.width    = width;
+		art.height   = height;
+		if (!load_shop_png(low_path, width, height, art.low)) {
+			continue;
+		}
+		int pink_x = -1;
+		int pink_y = -1;
+		for (int y = 0; y < height && pink_x < 0; ++y) {
+			for (int x = 0; x < width; ++x) {
+				if ((art.low[static_cast<size_t>(y) * width + x] &
+				     0x00ffffffu) == YesNoPink) {
+					pink_x = x;
+					pink_y = y;
+					break;
+				}
+			}
+		}
+		const auto high_path = (assets_root / "GRAPH" / file).string();
+		if (std::filesystem::is_regular_file(high_path, error)) {
+			if (!load_picture_png_rgba(high_path, width * HdScale,
+			                           height * HdScale, art.high)) {
+				LOG_WARNING("SEA2HD: YESNO %s has an unusable HD image",
+				            names[state]);
+				art.high.clear();
+			}
+		}
+		LOG_MSG("SEA2HD: Loaded YESNO picture %s (%dx%d)%s", names[state],
+		        width, height, art.high.empty() ? " [no HD]" : "");
+		yesno_arts[state] = std::move(art);
+		yesno_pink_x[state] = pink_x;
+		yesno_pink_y[state] = pink_y;
+		diag("YESNOLOAD %s %dx%d hd=%d", names[state], width, height,
+		     yesno_arts[state].high.empty() ? 0 : 1);
+	}
+}
+
+// 用粉色当闸门，确认画面上确实有选择框才值得做整屏搜索。
+bool yesno_pink_present(const uint32_t* source, const int source_width,
+                        const int source_height)
+{
+	int count = 0;
+	for (int y = 0; y < source_height; ++y) {
+		const auto* row = source + static_cast<size_t>(y) * source_width;
+		for (int x = 0; x < source_width; ++x) {
+			if ((row[x] & 0x00ffffffu) == YesNoPink) {
+				if (++count >= YesNoPinkMin) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+// 用粉色按钮块把搜索范围缩到几十像素：先按 16x16 网格找粉色最密的一片，
+// 再在它附近做锚点核对。选择框一出现就能在同一帧命中，不必等整屏搜索。
+int yesno_match_by_pink(const uint32_t* source, const int source_width,
+                        const int source_height)
+{
+	constexpr int CellSize = 16;
+	constexpr int CellCols = (VgaWidth + CellSize - 1) / CellSize;
+	constexpr int CellRows = (VgaHeight + CellSize - 1) / CellSize;
+	int cells[CellRows][CellCols] = {};
+	int best                       = 0;
+	for (int y = 0; y < source_height; ++y) {
+		const auto* srow = source + static_cast<size_t>(y) * source_width;
+		auto* crow       = cells[y / CellSize];
+		for (int x = 0; x < source_width; ++x) {
+			if ((srow[x] & 0x00ffffffu) == YesNoPink) {
+				const int count = ++crow[x / CellSize];
+				if (count > best) {
+					best = count;
+				}
+			}
+		}
+	}
+	if (best < 24) {
+		return -1;
+	}
+	const int cutoff = std::max(8, best * 3 / 5);
+	int cell_x0      = CellCols;
+	int cell_y0      = CellRows;
+	int cell_x1      = -1;
+	int cell_y1      = -1;
+	for (int cy = 0; cy < CellRows; ++cy) {
+		for (int cx = 0; cx < CellCols; ++cx) {
+			if (cells[cy][cx] < cutoff) {
+				continue;
+			}
+			cell_x0 = std::min(cell_x0, cx);
+			cell_y0 = std::min(cell_y0, cy);
+			cell_x1 = std::max(cell_x1, cx);
+			cell_y1 = std::max(cell_y1, cy);
+		}
+	}
+	if (cell_x1 < 0) {
+		return -1;
+	}
+	const int coarse_x = cell_x0 * CellSize;
+	const int coarse_y = cell_y0 * CellSize;
+	int best_hits      = 0;
+	int best_x         = 0;
+	int best_y         = 0;
+	int best_state     = -1;
+	for (int state = 0; state < YesNoStateCount; ++state) {
+		if (yesno_arts[state].width <= 0 || yesno_pink_x[state] < 0) {
+			continue;
+		}
+		const int base_x = coarse_x - yesno_pink_x[state];
+		const int base_y = coarse_y - yesno_pink_y[state];
+		for (int dy = -CellSize; dy <= CellSize; ++dy) {
+			for (int dx = -CellSize; dx <= CellSize; ++dx) {
+				const int ox = base_x + dx;
+				const int oy = base_y + dy;
+				if (ox < 0 || oy < 0 ||
+				    ox + yesno_arts[state].width > source_width ||
+				    oy + yesno_arts[state].height > source_height) {
+					continue;
+				}
+				const auto hits = graph_anchor_hits(
+				        yesno_arts[state], source, source_width, ox, oy);
+				if (hits > best_hits) {
+					best_hits  = hits;
+					best_x     = ox;
+					best_y     = oy;
+					best_state = state;
+					if (best_hits == 16) {
+						break;
+					}
+				}
+			}
+			if (best_hits == 16) {
+				break;
+			}
+		}
+		if (best_hits == 16) {
+			break;
+		}
+	}
+	if (best_state < 0 || best_hits < YesNoAnchorMin) {
+		return -1;
+	}
+	if (graph_match_percent(yesno_arts[best_state], source, source_width,
+	                        best_x, best_y) < YesNoMatchPercent) {
+		return -1;
+	}
+	yesno_x     = best_x;
+	yesno_y     = best_y;
+	yesno_state = best_state;
+	return best_state;
+}
+
+void draw_yesno_picture(const uint32_t* source, const int source_width,
+                        const int source_height, uint32_t* destination,
+                        const int destination_stride)
+{
+	if (source_width != VgaWidth) {
+		return;
+	}
+	preload_yesno_art();
+	if (yesno_arts[0].width <= 0 || yesno_arts[0].height <= 0) {
+		return;
+	}
+	const int width  = yesno_arts[0].width;
+	const int height = yesno_arts[0].height;
+
+	int matched = -1;
+	if (yesno_x >= 0 && yesno_y >= 0 && yesno_x + width <= source_width &&
+	    yesno_y + height <= source_height) {
+		// 先核对上次命中的状态，再核对另一种：两态只差按钮填充色，
+		// 命中后不必重新整屏搜索。
+		const int first = yesno_state >= 0 ? yesno_state : 0;
+		for (int n = 0; n < YesNoStateCount; ++n) {
+			const int state = (first + n) % YesNoStateCount;
+			if (yesno_arts[state].width <= 0) {
+				continue;
+			}
+			if (graph_match_percent(yesno_arts[state], source, source_width,
+			                        yesno_x, yesno_y) >= YesNoMatchPercent) {
+				matched = state;
+				break;
+			}
+		}
+	}
+	++yesno_search_tick;
+	if (matched < 0) {
+		yesno_x = -1;
+		yesno_y = -1;
+		// 先按粉色按钮块定位：每帧都做，代价只有几十微秒，选择框出现的
+		// 那一帧就能命中。
+		matched = yesno_match_by_pink(source, source_width, source_height);
+	}
+	if (matched < 0 && yesno_search_tick % YesNoSearchTick == 0 &&
+	    yesno_pink_present(source, source_width, source_height)) {
+		const int max_x    = source_width - width;
+		const int max_y    = source_height - height;
+		int best_hits      = 0;
+		int best_x         = 0;
+		int best_y         = 0;
+		int best_state     = -1;
+		for (int oy = 0; oy <= max_y; ++oy) {
+			for (int ox = 0; ox <= max_x; ++ox) {
+				for (int state = 0; state < YesNoStateCount; ++state) {
+					if (yesno_arts[state].width <= 0) {
+						continue;
+					}
+					const auto hits =
+					        graph_anchor_hits(yesno_arts[state], source,
+					                          source_width, ox, oy);
+					if (hits > best_hits) {
+						best_hits  = hits;
+						best_x     = ox;
+						best_y     = oy;
+						best_state = state;
+						if (best_hits == 16) {
+							break;
+						}
+					}
+				}
+				if (best_hits == 16) {
+					break;
+				}
+			}
+			if (best_hits == 16) {
+				break;
+			}
+		}
+		int percent = 0;
+		if (best_hits >= YesNoAnchorMin && best_state >= 0) {
+			percent = graph_match_percent(yesno_arts[best_state], source,
+			                              source_width, best_x, best_y);
+		}
+		if (best_hits >= YesNoAnchorMin && percent >= YesNoMatchPercent) {
+			yesno_x     = best_x;
+			yesno_y     = best_y;
+			yesno_state = best_state;
+			matched     = best_state;
+			diag("YESNOMATCH state=%d x=%d y=%d frame=%u", best_state, best_x,
+			     best_y, static_cast<unsigned>(composite_count));
+		} else if (best_hits >= 8 &&
+		           yesno_search_tick % YesNoLogInterval == 0) {
+			diag("YESNOSCAN best=%d state=%d x=%d y=%d pct=%d frame=%u",
+			     best_hits, best_state, best_x, best_y, percent,
+			     static_cast<unsigned>(composite_count));
+		}
+	}
+	if (matched < 0) {
+		return;
+	}
+
+	auto& art = yesno_arts[matched];
+	art.x     = yesno_x;
+	art.y     = yesno_y;
+
+	// 这一层要盖住下面所有内容：先撤掉低层在这个矩形里登记的箭头像素，
+	// 再由本层按“和参考图不同”重新登记箭头本体，最后统一由指针层贴回。
+	clear_pointer_notes(art.x, art.y, width, height);
+	const PointerGuard pointer;
+
+	if (art.high.empty()) {
+		// 还没有高清图：按 4 倍原始像素整块贴回，保证不被低层穿透。
+		for (int y = 0; y < height; ++y) {
+			const auto* srow =
+			        source + static_cast<size_t>(art.y + y) * source_width +
+			        art.x;
+			auto* drow = destination +
+			             static_cast<size_t>(art.y + y) * HdScale *
+			                     destination_stride +
+			             art.x * HdScale;
+			for (int dy = 0; dy < HdScale; ++dy) {
+				auto* out = drow +
+				            static_cast<size_t>(dy) * destination_stride;
+				for (int x = 0; x < width; ++x) {
+					const auto pixel = srow[x] & 0x00ffffffu;
+					for (int dx = 0; dx < HdScale; ++dx) {
+						out[x * HdScale + dx] = pixel;
+					}
+				}
+			}
+		}
+		return;
+	}
+
+	const int high_stride = width * HdScale;
+	for (int y = 0; y < height; ++y) {
+		const auto* srow =
+		        source + static_cast<size_t>(art.y + y) * source_width + art.x;
+		const auto* hrow = art.high.data() +
+		                   static_cast<size_t>(y * HdScale) * high_stride;
+		auto* drow = destination +
+		             static_cast<size_t>(art.y + y) * HdScale *
+		                     destination_stride +
+		             art.x * HdScale;
+		for (int dy = 0; dy < HdScale; ++dy) {
+			const auto* src = hrow + static_cast<size_t>(dy) * high_stride;
+			auto* out = drow +
+			            static_cast<size_t>(dy) * destination_stride;
+			for (int dx = 0; dx < high_stride; ++dx) {
+				const int x = dx / HdScale;
+				if (pointer.inside_draw(art.x + x, art.y + y) &&
+				    reference_distance(
+				            art.low[static_cast<size_t>(y) * width + x] &
+				                    0x00ffffffu,
+				            srow[x] & 0x00ffffffu) > PointerDrawTolerance) {
+					note_pointer_pixel(art.x + x, art.y + y);
+				}
+				if ((src[dx] >> 24) >= 128) {
+					out[dx] = src[dx] & 0x00ffffffu;
+				}
+			}
+		}
 	}
 }
 
@@ -10644,7 +11705,7 @@ void drop_scene_text_state()
 	vga_write_planes.fill(0);
 	vga_write_dirty = false;
 	// 新场景没有旧画面的绘制次序概念，遮挡判定全部从头开始。
-	frame_base_order     = 0;
+	frame_base_batch     = 0;
 	frame_base_known     = false;
 	window_occludes_valid = false;
 	window_occludes.fill(0);
@@ -10739,6 +11800,11 @@ uint32_t window_paper_color(const uint32_t* source, const int source_width,
 		percent = 0;
 		return 0;
 	}
+	// 指针是游戏自己画进帧缓冲的，它占住的那一小块不是纸色。统计纸色时
+	// 必须排除，否则指针停在窗口上时纸色/占比会被拉偏。
+	uint16_t pointer_x = 0;
+	uint16_t pointer_y = 0;
+	const bool has_pointer = MOUSEDOS_GetCursorPosition(pointer_x, pointer_y);
 	struct Entry {
 		uint32_t color;
 		int count;
@@ -10750,6 +11816,10 @@ uint32_t window_paper_color(const uint32_t* source, const int source_width,
 	const int step_y = std::max(1, (y1 - y0) / 32);
 	for (int sy = y0; sy < y1; sy += step_y) {
 		for (int sx = x0; sx < x1; sx += step_x) {
+			if (has_pointer &&
+			    inside_pointer_box(sx, sy, pointer_x, pointer_y)) {
+				continue;
+			}
 			const auto color = window_color_at(source, source_width,
 			                                   source_height, sx, sy);
 			++total;
@@ -10792,6 +11862,10 @@ void window_ring_stats(const uint32_t* source, const int source_width,
 	int total   = 0;
 	int foreign = 0;
 	weakest_side_percent = 100;
+	// 指针压住的采样点取到的是箭头颜色，会让这一条边看起来"没有边框"。
+	uint16_t pointer_x = 0;
+	uint16_t pointer_y = 0;
+	const bool has_pointer = MOUSEDOS_GetCursorPosition(pointer_x, pointer_y);
 	const int left   = x + WindowBorderInset;
 	const int right  = x + width - 1 - WindowBorderInset;
 	const int top    = y + WindowBorderInset;
@@ -10821,6 +11895,10 @@ void window_ring_stats(const uint32_t* source, const int source_width,
 				sy = bottom - ((bottom - top) * k) / denom;
 				break;
 			}
+			if (has_pointer &&
+			    inside_pointer_box(sx, sy, pointer_x, pointer_y)) {
+				continue;
+			}
 			const auto color = window_color_at(source, source_width,
 			                                   source_height, sx, sy);
 			++side_total;
@@ -10849,9 +11927,10 @@ void window_merge_candidate(const int x0, const int y0, const int x1,
 			candidate.y0 = std::min(candidate.y0, y0);
 			candidate.x1 = std::max(candidate.x1, x1);
 			candidate.y1 = std::max(candidate.y1, y1);
-			// 同一扇窗口可能分几帧画完：取最早的绘制次序，窗口内的文字
-			// 只要是在填充之后 blit 的，order 就一定比它大。
+			// 同一扇窗口可能分几帧画完：取最早的绘制次序与批次，窗口内的
+			// 文字只要是在填充之后 blit 的，order 就一定比它大。
 			candidate.order = std::min(candidate.order, vga_write_order);
+			candidate.batch = std::min(candidate.batch, vga_write_batch);
 			return;
 		}
 	}
@@ -10864,6 +11943,7 @@ void window_merge_candidate(const int x0, const int y0, const int x1,
 			candidate.x1 = x1;
 			candidate.y1 = y1;
 			candidate.order = vga_write_order;
+			candidate.batch = vga_write_batch;
 			return;
 		}
 	}
@@ -10882,6 +11962,7 @@ void window_merge_candidate(const int x0, const int y0, const int x1,
 	candidate.x1    = x1;
 	candidate.y1    = y1;
 	candidate.order = vga_write_order;
+	candidate.batch = vga_write_batch;
 }
 
 // 把累积的写入位图切成"同宽、连续多行"的矩形。只有一行的填充（文字行）会
@@ -10940,14 +12021,35 @@ void window_extract_write_rects()
 		for (size_t i = 0; i < open_count; ++i) {
 			bool extended = false;
 			for (size_t j = 0; j < run_count; ++j) {
-				if (!used[j] && runs[j].x0 == open[i].x0 &&
-				    runs[j].x1 == open[i].x1) {
-					used[j] = true;
-					open[i].y1 = row;
-					next[next_count++] = open[i];
-					extended = true;
-					break;
+				if (used[j]) {
+					continue;
 				}
+				const int run_width  = runs[j].x1 - runs[j].x0 + 1;
+				const int span_width = open[i].x1 - open[i].x0 + 1;
+				const int overlap =
+				        std::min(runs[j].x1, open[i].x1) -
+				        std::max(runs[j].x0, open[i].x0) + 1;
+				// 宽度相近（边框行）且大部分重叠才接续；整屏重绘那种整行
+				// 填充比窗口宽得多，不会被吸进来。
+				const bool same_run =
+				        runs[j].x0 == open[i].x0 && runs[j].x1 == open[i].x1;
+				const bool same_edge =
+				        std::abs(run_width - span_width) <=
+				                WindowSpanWidthSlackBytes &&
+				        overlap > 0 &&
+				        overlap * 100 >=
+				                run_width * WindowSpanOverlapPercent;
+				if (!same_run && !same_edge) {
+					continue;
+				}
+				used[j] = true;
+				// 取并集：上边框 / 下边框那一行可能比填充行更宽。
+				open[i].x0 = std::min(open[i].x0, runs[j].x0);
+				open[i].x1 = std::max(open[i].x1, runs[j].x1);
+				open[i].y1 = row;
+				next[next_count++] = open[i];
+				extended = true;
+				break;
 			}
 			if (!extended) {
 				close_span(open[i]);
@@ -10976,8 +12078,9 @@ void window_extract_write_rects()
 
 void window_register(const int x, const int y, const int width,
                      const int height, const uint32_t paper,
-                     const uint32_t order, const uint32_t* source,
-                     const int source_width, const int source_height)
+                     const uint32_t order, const uint32_t batch,
+                     const uint32_t* source, const int source_width,
+                     const int source_height)
 {
 	WindowRect* target = nullptr;
 	for (size_t i = 0; i < window_rect_count; ++i) {
@@ -11020,14 +12123,26 @@ void window_register(const int x, const int y, const int width,
 	// 用的是这批填充发生时的绘制次序，而不是"检测到它的时刻"：这样窗口
 	// 之后 blit 的文字/数字 order 更大（在窗口之上），之前画的则更小。
 	target->order   = order;
+	target->batch   = batch;
 	target->lost_frames   = 0;
 	target->hidden_frames = 0;
+	uint16_t pointer_x = 0;
+	uint16_t pointer_y = 0;
+	const bool has_pointer = MOUSEDOS_GetCursorPosition(pointer_x, pointer_y);
 	for (int i = 0; i < WindowBorderSamples; ++i) {
 		int sx = 0;
 		int sy = 0;
 		window_border_point(*target, i, sx, sy);
+		// 指针压住的采样点取到的是箭头，不能进签名：指针移开后再拿它
+		// 比对必然不符，窗口会被误判成"已经消失"。
+		if (has_pointer && inside_pointer_box(sx, sy, pointer_x, pointer_y)) {
+			target->signature[i]       = 0;
+			target->signature_known[i] = 0;
+			continue;
+		}
 		target->signature[i] = window_color_at(source, source_width,
 		                                       source_height, sx, sy);
+		target->signature_known[i] = 1;
 	}
 	target->signature_valid = true;
 }
@@ -11044,22 +12159,32 @@ void window_finalize_candidate(const WindowCandidate& candidate,
 	    width * height < WindowMinAreaPx) {
 		return;
 	}
+	// 角色选择界面的头像装饰框（含右/下阴影）不是窗口，而是底图的一部分。
+	// 悬停 / 点击头像时游戏会重画这一圈，写追踪会把它当窗口；一旦登记，
+	// 窗口恢复就会把高清底图的边框改回 4 倍原始像素，头像外围出现低清圈。
+	if (rect_is_portrait_frame(x, y, width, height)) {
+		diag("WINSKIP x=%d y=%d w=%d h=%d why=portrait frame=%u", x, y,
+		     width, height, static_cast<unsigned>(composite_count));
+		return;
+	}
 	if (width * 100 >= source_width * WindowMaxScreenPercent &&
 	    height * 100 >= source_height * WindowMaxScreenPercent) {
 		// 这一批写入就是整屏框体重绘（港口 / 航海 / 建筑进入时都会这样刷
 		// 一遍）。它不是窗口，而是新的画面基准：框体照常无条件换高清，只
 		// 把比它更早登记、已经被这次重绘覆盖掉的窗口作废。
-		frame_base_order = std::max(frame_base_order, candidate.order);
+		frame_base_batch = std::max(frame_base_batch, candidate.batch);
 		frame_base_known = true;
 		size_t kept = 0;
 		for (size_t i = 0; i < window_rect_count; ++i) {
-			if (window_rects[i].order > frame_base_order) {
+			// 同一批写入（批次号相等）里的窗口是在框体之后画的，必须保留。
+			if (window_rects[i].batch >= frame_base_batch) {
 				window_rects[kept++] = window_rects[i];
 			}
 		}
 		if (kept != window_rect_count) {
-			diag("FRAMEBASE order=%u dropped=%u frame=%u",
-			     static_cast<unsigned>(frame_base_order),
+			diag("FRAMEBASE batch=%u order=%u dropped=%u frame=%u",
+			     static_cast<unsigned>(frame_base_batch),
+			     static_cast<unsigned>(candidate.order),
 			     static_cast<unsigned>(window_rect_count - kept),
 			     static_cast<unsigned>(composite_count));
 		}
@@ -11083,22 +12208,30 @@ void window_finalize_candidate(const WindowCandidate& candidate,
 	        ring_percent >= WindowRingMinPercent &&
 	        (weakest_side >= WindowRingSideMinPercent ||
 	         ring_percent >= WindowRingStrongPercent);
-	if (paper_percent < WindowPaperMinPercent || !strong_ring) {
+	// 人物属性面板这类窗口内部有头像、文字，主色占比必然很低（实测 24%~34%），
+	// 但四周边框是完整的。纸色占比只在"没有边框证据"时才用来兜底，否则这些
+	// 面板永远登不上记，底图高清就会整块压住它们。
+	const bool solid_paper = paper_percent >= WindowPaperMinPercent;
+	if (!solid_paper && !strong_ring) {
 		diag("WINREJ x=%d y=%d w=%d h=%d why=%s inside=%d%% ring=%d%% weak=%d%% frame=%u",
-		     x, y, width, height,
-		     paper_percent < WindowPaperMinPercent ? "paper" : "ring",
+		     x, y, width, height, solid_paper ? "ring" : "paper",
 		     paper_percent, ring_percent, weakest_side, composite_count);
 		return;
 	}
-	window_register(x, y, width, height, paper, candidate.order, source,
-	                source_width, source_height);
+	window_register(x, y, width, height, paper, candidate.order,
+	                candidate.batch, source, source_width, source_height);
 }
 
-bool window_covered_by_newer(const int x, const int y, const uint32_t order)
+bool window_covered_by_newer(const int x, const int y, const uint32_t order,
+                             const uint32_t batch)
 {
 	for (size_t i = 0; i < window_rect_count; ++i) {
 		const auto& other = window_rects[i];
-		if (other.order <= order) {
+		// 先比批次号：批次更大的一定是后画的，即使两批之间没有 blit、
+		// blit_order 完全相同。批次相同再比 order。
+		const bool newer = other.batch > batch ||
+		                   (other.batch == batch && other.order > order);
+		if (!newer) {
 			continue;
 		}
 		if (x >= other.x - WindowOcclusionMargin &&
@@ -11113,7 +12246,7 @@ bool window_covered_by_newer(const int x, const int y, const uint32_t order)
 
 bool sea2_hd_window_covers(const int x, const int y, const uint32_t order)
 {
-	return window_covered_by_newer(x, y, order);
+	return window_covered_by_newer(x, y, order, IgnoreWriteBatch);
 }
 
 // 每帧核对窗口。只在"露出来的边框"上取样：被更新的窗口或指针盖住的采样
@@ -11129,6 +12262,12 @@ void window_verify(const uint32_t* source, const int source_width,
 	size_t kept = 0;
 	for (size_t i = 0; i < window_rect_count; ++i) {
 		WindowRect& window = window_rects[i];
+		// 角色选择界面的头像装饰框不是窗口（见 rect_is_portrait_frame）。
+		// 之前按窗口登记过的，在这里丢掉，窗口恢复就不会再把高清边框改回 4x。
+		if (rect_is_portrait_frame(window.x, window.y, window.width,
+		                           window.height)) {
+			continue;
+		}
 		int exposed    = 0;
 		int mismatched = 0;
 		for (int s = 0; s < WindowBorderSamples; ++s) {
@@ -11139,11 +12278,15 @@ void window_verify(const uint32_t* source, const int source_width,
 			    sy >= source_height) {
 				continue;
 			}
+			// 登记时就被指针压住的点没有有效签名，永远不参与比对。
+			if (window.signature_known[s] == 0) {
+				continue;
+			}
 			if (has_pointer && inside_pointer_box(sx, sy, pointer_x,
 			                                      pointer_y)) {
 				continue;
 			}
-			if (window_covered_by_newer(sx, sy, window.order)) {
+			if (window_covered_by_newer(sx, sy, window.order, window.batch)) {
 				continue;
 			}
 			++exposed;
@@ -11213,7 +12356,7 @@ void window_update(const uint32_t* source, const int source_width,
 		hash ^= value;
 		hash *= 1099511628211ull;
 	};
-	mix(frame_base_order);
+	mix(frame_base_batch);
 	mix(window_rect_count);
 	for (size_t i = 0; i < window_rect_count; ++i) {
 		const auto& w = window_rects[i];
@@ -11221,20 +12364,22 @@ void window_update(const uint32_t* source, const int source_width,
 		    static_cast<uint64_t>(w.width) << 16 |
 		    static_cast<uint64_t>(w.height));
 		mix(w.order);
+		mix(w.batch);
 		mix(w.lost_frames);
 	}
 	static uint64_t logged_window_hash = 0;
 	if (hash != logged_window_hash) {
 		logged_window_hash = hash;
-		diag("WINSET base=%u n=%u frame=%u",
-		     static_cast<unsigned>(frame_base_order),
+		diag("WINSET base_batch=%u n=%u frame=%u",
+		     static_cast<unsigned>(frame_base_batch),
 		     static_cast<unsigned>(window_rect_count),
 		     static_cast<unsigned>(composite_count));
 		for (size_t i = 0; i < window_rect_count; ++i) {
 			const auto& w = window_rects[i];
-			diag("WINSET-RECT i=%u x=%d y=%d w=%d h=%d order=%u lost=%u paper=%06X frame=%u",
+			diag("WINSET-RECT i=%u x=%d y=%d w=%d h=%d order=%u batch=%u lost=%u paper=%06X frame=%u",
 			     static_cast<unsigned>(i), w.x, w.y, w.width, w.height,
 			     static_cast<unsigned>(w.order),
+			     static_cast<unsigned>(w.batch),
 			     static_cast<unsigned>(w.lost_frames),
 			     static_cast<unsigned>(w.paper),
 			     static_cast<unsigned>(composite_count));
@@ -11259,8 +12404,9 @@ void window_restore_pixels(const uint32_t* source, const int source_width,
 	        source_width == VgaWidth && source_height == VgaHeight;
 	for (size_t i = 0; i < window_rect_count; ++i) {
 		const auto& window = window_rects[i];
-		// 比最近一次整屏框体重绘更早的写入已经被覆盖，不必恢复。
-		if (frame_base_known && window.order <= frame_base_order) {
+		// 比最近一次整屏框体重绘更早批次的写入已经被覆盖，不必恢复；同一批
+		// 里的窗口（批次号等于基准）在框体之后绘制，仍然要恢复。
+		if (frame_base_known && window.batch < frame_base_batch) {
 			continue;
 		}
 		// 本帧判定这块其实只是框体自己重画的一片：高清已经画上去了，
@@ -11340,6 +12486,7 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 	// 建筑内景小画（方案 B）：只在画面确实是那张图时替换成 4 倍平滑版本。
 	if (source_width == VgaWidth && source_height == VgaHeight) {
 		hd_art_mask.fill(0);
+		pointer_overlay_mask.fill(0);
 		// 遮挡判定由本帧绘制重新给出；没给出前按"都遮挡"处理（旧行为）。
 		window_occludes_valid = false;
 		draw_scene_pictures(source, source_width, destination,
@@ -11612,6 +12759,27 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 			return static_cast<uint8_t>(std::clamp(scaled, 0.0, 255.0));
 		};
 
+		// 立绘上有没有指针：指针是游戏画进帧缓冲的，只能从低清源里贴回去。
+		// 立绘的遮挡判定按"邻像素相等关系"的图案做，箭头内部整片的同色
+		// （填充）不会改变图案，于是立绘的高清会画进箭头内部，箭头变得
+		// 残缺、只剩一圈低清描边。这里在指针方框内直接与锁存时的立绘像素
+		// 比颜色：颜色变了的就是箭头本体，保留低清并登记，最终统一贴回。
+		const PointerGuard pointer;
+		const auto is_pointer_pixel = [&](const int fx, const int fy,
+		                                  const int lx, const int ly) {
+			if (!command.pixels_valid || !pointer.inside_draw(fx, fy)) {
+				return false;
+			}
+			const auto stored =
+			        command.pixels[static_cast<size_t>(ly) * Kao64Width + lx] &
+			        0x00ffffffu;
+			const auto current =
+			        source[static_cast<size_t>(fy) * source_width + fx] &
+			        0x00ffffffu;
+			return reference_distance(stored, current) >
+			       KaoPointerStoredTolerance;
+		};
+
 		for (int y = 0; y < Kao64Height * HdScale; ++y) {
 			const auto* src = asset->rgba.data() +
 			                  static_cast<size_t>(y) * Kao64Width * HdScale * 4;
@@ -11627,6 +12795,14 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 
 			for (int x = 0; x < Kao64Width * HdScale; ++x) {
 				if (covered_row[x / HdScale] != 0) {
+					continue;
+				}
+				const int lx = x / HdScale;
+				const int ly = y / HdScale;
+				const int fx = static_cast<int>(command.x) + lx;
+				const int fy = static_cast<int>(command.y) + ContentYOffset + ly;
+				if (is_pointer_pixel(fx, fy, lx, ly)) {
+					note_pointer_pixel(fx, fy);
 					continue;
 				}
 				const auto alpha = src[x * 4 + 3];
@@ -12331,6 +13507,17 @@ void SEA2_HD_Composite(const uint32_t* source, const int source_width,
 			     static_cast<int>(pointer_y));
 		}
 	}
+	// 第三层：是/否选择框。它压在所有对话框/窗口/立绘/文字之上，只让最后
+	// 的指针层盖住它，因此低层的立绘不可能再穿透到选择框上。
+	if (source_width == VgaWidth && source_height == VgaHeight) {
+		draw_yesno_picture(source, source_width, source_height, destination,
+		                   destination_stride);
+	}
+	// 所有高清层（面板、窗口、文字、数字、立绘……）都画完之后，最后把本轮
+	// 登记的指针像素按 4 倍覆盖上去：指针永远是最高层，不受任何遮挡判定影响。
+	draw_pointer_overlay(source, source_width, destination,
+	                     destination_stride);
+
 	++composite_count;
 
 	// 循环里请求的"再合成一次"要留到函数返回之后才有效：这行如果无条件写 false，
